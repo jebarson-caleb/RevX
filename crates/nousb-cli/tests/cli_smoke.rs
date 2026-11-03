@@ -6,6 +6,11 @@ fn nousb() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nousb"))
 }
 
+/// Disposable QEMU rehearsals run through WSL2 and fail closed elsewhere.
+fn only_on_windows(stderr: &str) -> bool {
+    !cfg!(target_os = "windows") && stderr.contains("only available on Windows")
+}
+
 #[test]
 fn json_plan_contains_machine_readable_fields() {
     let output = nousb()
@@ -192,7 +197,9 @@ fn qemu_smoke_plan_never_attaches_host_storage_or_network() {
         assert!(stdout.contains("\"ram_boot_verified\":false"));
     } else {
         let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-        assert!(stderr.contains("project-local QEMU runtime is incomplete"));
+        assert!(
+            stderr.contains("project-local QEMU runtime is incomplete") || only_on_windows(&stderr)
+        );
     }
 }
 
@@ -213,7 +220,11 @@ fn ubuntu_netboot_plan_labels_partial_ram_evidence_and_direct_boot() {
         assert!(stdout.contains("transport-only-not-installable"));
     } else {
         let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-        assert!(stderr.contains("Ubuntu rehearsal") || stderr.contains("QEMU runtime"));
+        assert!(
+            stderr.contains("Ubuntu rehearsal")
+                || stderr.contains("QEMU runtime")
+                || only_on_windows(&stderr)
+        );
     }
 }
 
@@ -241,6 +252,7 @@ fn ubuntu_full_ram_plan_is_explicit_about_network_http_and_uefi_limits() {
             stderr.contains("pinned Ubuntu Server ISO is missing")
                 || stderr.contains("QEMU runtime")
                 || stderr.contains("staging")
+                || only_on_windows(&stderr)
         );
     }
 }
@@ -271,6 +283,7 @@ fn ubuntu_uefi_full_ram_plan_requires_verified_official_boot_assets() {
                 || stderr.contains("QEMU runtime")
                 || stderr.contains("staging")
                 || stderr.contains("EFI asset")
+                || only_on_windows(&stderr)
         );
     }
 }
@@ -301,8 +314,91 @@ fn current_os_baseline_plan_is_disposable_and_does_not_overclaim_fallback() {
                 || stderr.contains("staging")
                 || stderr.contains("EFI asset")
                 || stderr.contains("disposable current OS")
+                || only_on_windows(&stderr)
         );
     }
+}
+
+#[test]
+fn runtime_bootstrap_plan_is_project_local_and_confirmation_gated() {
+    let output = nousb()
+        .args(["--json", "vm", "qemu", "plan-runtime"])
+        .output()
+        .expect("run nousb vm qemu plan-runtime");
+    if output.status.success() {
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        assert!(stdout.contains("qemu-system-x86_64~10.1.5"));
+        assert!(stdout.contains("efibootmgr"));
+        assert!(stdout.contains("\"installs_into_windows\":false"));
+        assert!(stdout.contains("\"host_boot_changes\":false"));
+        assert!(stdout.contains("ASSEMBLE PROJECT-LOCAL QEMU RUNTIME"));
+    } else {
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(only_on_windows(&stderr));
+    }
+
+    let output = nousb()
+        .args(["vm", "qemu", "bootstrap-runtime", "yes"])
+        .output()
+        .expect("run nousb vm qemu bootstrap-runtime");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("type exactly") || only_on_windows(&stderr));
+}
+
+#[test]
+fn one_shot_plan_uses_bootnext_without_persistent_order_changes() {
+    let output = nousb()
+        .args(["--json", "vm", "qemu", "plan-current-os-one-shot"])
+        .output()
+        .expect("run nousb vm qemu plan-current-os-one-shot");
+
+    if output.status.success() {
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        assert!(stdout.contains("\"persistent_boot_order_changes\":false"));
+        assert!(stdout.contains("\"temporary_entry_label\":\"NoUSB-OneShot\""));
+        assert!(stdout.contains("\"after-bootnext-armed\""));
+        assert!(stdout.contains("\"during-installer-boot\""));
+        assert!(stdout.contains("\"network_enabled\":false"));
+        assert!(stdout.contains("\"physical_disks_attached\":false"));
+        assert!(stdout.contains("\"host_boot_changes\":false"));
+        assert!(stdout.contains("\"secure_boot_enabled\":false"));
+        assert!(stdout.contains("RUN DISPOSABLE CURRENT OS UEFI ONE-SHOT MATRIX"));
+    } else {
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(
+            stderr.contains("pinned Ubuntu Server ISO is missing")
+                || stderr.contains("QEMU runtime")
+                || stderr.contains("staging")
+                || stderr.contains("EFI asset")
+                || stderr.contains("disposable current OS")
+                || stderr.contains("efibootmgr")
+                || only_on_windows(&stderr)
+        );
+    }
+}
+
+#[test]
+fn one_shot_rehearsal_rejects_unknown_scenarios_and_loose_confirmation() {
+    let output = nousb()
+        .args([
+            "vm",
+            "qemu",
+            "rehearse-current-os-one-shot",
+            "RUN DISPOSABLE CURRENT OS UEFI ONE-SHOT MATRIX",
+            "skip-cleanup",
+        ])
+        .output()
+        .expect("run nousb with unknown scenario");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("unknown one-shot scenario skip-cleanup"));
+
+    let output = nousb()
+        .args(["--yes", "vm", "qemu", "rehearse-current-os-one-shot", "yes"])
+        .output()
+        .expect("run nousb with loose confirmation");
+    assert!(!output.status.success());
 }
 
 #[test]
@@ -428,6 +524,106 @@ fn simulate_persists_report_for_listing_and_showing() {
     let show_stdout = String::from_utf8(show.stdout).expect("utf8 show stdout");
     assert!(show_stdout.contains("\"status\":\"interrupted\""));
 
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn signature_check_fails_closed_without_a_pinned_vendor_key() {
+    let output = nousb()
+        .args(["image", "verify-signature", "windows-11"])
+        .output()
+        .expect("run nousb image verify-signature");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("no pinned vendor signing key"));
+
+    let catalog = nousb()
+        .args(["--json", "catalog", "list"])
+        .output()
+        .expect("run nousb catalog list");
+    let stdout = String::from_utf8(catalog.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("\"signing_key\":\"ubuntu-cdimage-2012\""));
+    assert!(stdout.contains("\"signing_key\":\"fedora-44\""));
+}
+
+#[test]
+fn saved_reports_drive_recover_resume_and_rollback() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "nousb-cli-recover-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let run = |args: &[&str]| {
+        nousb()
+            .current_dir(&temp_dir)
+            .args(args)
+            .output()
+            .expect("run nousb")
+    };
+
+    let simulate = run(&[
+        "--json",
+        "--interrupt-after",
+        "2",
+        "simulate",
+        "boot-once",
+        "ubuntu-24.04-desktop",
+    ]);
+    assert!(simulate.status.success());
+    let plan_id = extract_json_string(&String::from_utf8_lossy(&simulate.stdout), "plan_id")
+        .expect("plan id");
+
+    let recover = run(&["--json", "reports", "recover", &plan_id]);
+    assert!(recover.status.success());
+    let recover_stdout = String::from_utf8_lossy(&recover.stdout);
+    assert!(recover_stdout.contains("\"recommended\":\"resume\""));
+
+    let resume = run(&["--json", "resume", &plan_id]);
+    assert!(resume.status.success());
+    assert!(String::from_utf8_lossy(&resume.stdout).contains("\"status\":\"completed\""));
+
+    // A completed operation is neither resumed again nor rolled back automatically.
+    assert!(!run(&["resume", &plan_id]).status.success());
+    assert!(!run(&["rollback", &plan_id]).status.success());
+
+    let failed = run(&[
+        "--json",
+        "--fail-step",
+        "verify-installer",
+        "simulate",
+        "boot-once",
+        "ubuntu-24.04-desktop",
+    ]);
+    assert!(failed.status.success());
+    let failed_stdout = String::from_utf8_lossy(&failed.stdout);
+    assert!(failed_stdout.contains("\"status\":\"failed\""));
+    let failed_id = extract_json_string(&failed_stdout, "plan_id").expect("failed plan id");
+    let recover = run(&["--json", "reports", "recover", &failed_id]);
+    assert!(String::from_utf8_lossy(&recover.stdout).contains("\"recommended\":\"rollback\""));
+    assert!(!run(&["resume", &failed_id]).status.success());
+    let rollback = run(&["--json", "rollback", &failed_id]);
+    assert!(rollback.status.success());
+    assert!(String::from_utf8_lossy(&rollback.stdout).contains("\"status\":\"rolled_back\""));
+
+    assert!(!run(&["rollback", "no-such-operation"]).status.success());
+
+    // Reports are mirrored into the SQLite journal, so recovery survives a lost JSON file.
+    let migrate = run(&["--json", "journal", "migrate"]);
+    assert!(migrate.status.success());
+    assert!(String::from_utf8_lossy(&migrate.stdout).contains("\"imported_reports\":2"));
+    std::fs::remove_file(
+        temp_dir
+            .join(".nousb")
+            .join("reports")
+            .join(format!("{failed_id}.json")),
+    )
+    .expect("remove saved JSON report");
+    let recover = run(&["--json", "reports", "recover", &failed_id]);
+    assert!(recover.status.success());
+    assert!(String::from_utf8_lossy(&recover.stdout).contains("\"plan_id\""));
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 

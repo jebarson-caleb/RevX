@@ -1,5 +1,7 @@
 # Contributing
 
+The full guide is in the repository root: [CONTRIBUTING.md](../CONTRIBUTING.md).
+
 Keep changes small, typed, and testable.
 
 Before submitting:

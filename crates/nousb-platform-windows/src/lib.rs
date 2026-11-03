@@ -17,6 +17,13 @@ use std::process::{Child, Command, Output, Stdio};
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod host_boot;
+pub use host_boot::*;
+mod one_shot;
+pub use one_shot::*;
+mod secure_boot;
+pub use secure_boot::*;
+
 pub struct WindowsSafeAdapter;
 
 impl PlatformAdapter for WindowsSafeAdapter {
@@ -54,6 +61,13 @@ Write-Output "free_bytes=$($drive.AvailableFreeSpace)"
 Write-Output "drive_size_bytes=$($drive.TotalSize)"
 Write-Output "drive_format=$($drive.DriveFormat)"
 Write-Output "system_drive=$env:SystemDrive"
+$parts = Get-Partition
+if ($parts) {
+    $esp = $parts | Where-Object { $_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' } | Select-Object -First 1
+    if ($esp) { Write-Output "esp=disk $($esp.DiskNumber) partition $($esp.PartitionNumber)|$($esp.Size)" } else { Write-Output "esp=none" }
+    $recovery = $parts | Where-Object { $_.GptType -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' } | Select-Object -First 1
+    Write-Output "recovery_partition=$(if ($recovery) { 1 } else { 0 })"
+}
 "#;
     let output = match Command::new("powershell.exe")
         .args([
@@ -88,6 +102,7 @@ Write-Output "system_drive=$env:SystemDrive"
         .push("Windows platform inventory was collected read-only; no BCD, EFI, disk, or BitLocker settings were changed.".into());
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn apply_windows_inventory_output(inventory: &mut SystemInventory, stdout: &str) {
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -158,9 +173,44 @@ fn apply_windows_inventory_output(inventory: &mut SystemInventory, stdout: &str)
             "bitlocker" if value.eq_ignore_ascii_case("off") || value == "0" => {
                 inventory.encryption = EncryptionState::Disabled;
             }
+            "esp" if value == "none" => {
+                inventory.boot_hints.esp_present = Some(false);
+            }
+            "esp" => {
+                let (location, size) = value.split_once('|').unwrap_or((value, ""));
+                inventory.boot_hints.esp_present = Some(true);
+                inventory.boot_hints.esp_location = Some(location.trim().into());
+                inventory.boot_hints.esp_size_bytes = size.trim().parse().ok();
+            }
+            "recovery_partition" => {
+                inventory.boot_hints.recovery_partition_present = Some(value == "1");
+            }
             _ => {}
         }
     }
+
+    let hints = &mut inventory.boot_hints;
+    hints.unknowns.clear();
+    if hints.esp_present.is_none() {
+        hints
+            .unknowns
+            .push("ESP: Get-Partition returned nothing for this identity".into());
+    }
+    if inventory.firmware == FirmwareMode::Uefi
+        && hints.esp_present == Some(true)
+        && !hints
+            .boot_managers
+            .iter()
+            .any(|item| item.starts_with("Windows Boot Manager"))
+    {
+        hints
+            .boot_managers
+            .push("Windows Boot Manager (inferred from a UEFI Windows install)".into());
+    }
+    hints.unknowns.push(
+        "firmware boot entries, BootNext, and BCD: need administrative rights (SeSystemEnvironmentPrivilege); not queried"
+            .into(),
+    );
 }
 
 pub fn real_boot_changes_enabled() -> bool {
@@ -746,25 +796,37 @@ impl WindowsQemuCurrentOsReport {
     }
 }
 
+#[cfg(target_os = "windows")]
 const UBUNTU_NETBOOT_KERNEL_SHA256: &str =
     "d3f1cc6693d93fcf6663cd1e04d31031f41e8abd0c14b0ca953ef524a62e4489";
+#[cfg(target_os = "windows")]
 const UBUNTU_NETBOOT_INITRD_SHA256: &str =
     "82793369fda2356c7344bd37af2453ad56d797d49c01b9d7b3f2a85ce8178d86";
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_ISO_SHA256: &str =
     "e907d92eeec9df64163a7e454cbc8d7755e8ddc7ed42f99dbc80c40f1a138433";
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_ISO_SIZE: u64 = 3_405_469_696;
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_KERNEL_SHA256: &str =
     "528d909745819a1464848a2c4d91c609db4f54b33ccae7069aad4178fb34606f";
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_INITRD_SHA256: &str =
     "b91245030e13a1dc835205b77561323b26bea1cbbf4f5ed43aa0cfff08d4e353";
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_BOOTX64_SHA256: &str =
     "6fe6e1bcbe6cf6baec8e056d40361ca1aa715cc04ddcc2855351de060b84350b";
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_GRUBX64_SHA256: &str =
     "52b8b3503d3efabfac8793f07e1db5d22c51d90ebb5b6319962fab5d02f49956";
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_MMX64_SHA256: &str =
     "d2fa8e52fddc99dad94a0009fee23cb2478c28373b777d50b2f784eb4e96f88e";
+#[cfg(target_os = "windows")]
 const UBUNTU_SERVER_RECOVERY_PORT: u16 = 18_080;
+#[cfg(target_os = "windows")]
 const DISPOSABLE_CURRENT_OS_DISK_SIZE: u64 = 536_870_912;
+#[cfg(target_os = "windows")]
 const DISPOSABLE_CURRENT_OS_MARKER: &str = "NOUSB_DISPOSABLE_CURRENT_OS_READY";
 
 #[cfg(target_os = "windows")]
@@ -1241,9 +1303,35 @@ fn run_wsl_checked(arguments: &[String], description: &str) -> Result<(), NoUsbE
 }
 
 #[cfg(target_os = "windows")]
+fn run_wsl_output(arguments: &[String], description: &str) -> Result<String, NoUsbError> {
+    let output = Command::new("wsl.exe")
+        .args(["-d", "docker-desktop", "--"])
+        .args(arguments)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| NoUsbError::Io(format!("cannot {description}: {error}")))?;
+    if !output.status.success() {
+        return Err(NoUsbError::Io(format!(
+            "cannot {description} ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn disposable_current_os_baseline_init() -> String {
+    format!(
+        "#!/bin/sh\n/bin/mount -t proc proc /proc 2>/dev/null || true\n/bin/mount -t sysfs sysfs /sys 2>/dev/null || true\n/bin/mount -t devtmpfs devtmpfs /dev 2>/dev/null || true\n/bin/mkdir -p /dev/pts /run /tmp\n/bin/mount -t devpts devpts /dev/pts 2>/dev/null || true\necho '{DISPOSABLE_CURRENT_OS_MARKER}'\necho 'NoUSB disposable current OS userspace is running from /dev/vda.'\n"
+    )
+}
+
+#[cfg(target_os = "windows")]
 fn create_disposable_current_os_root(
     run_directory: &Path,
     plan: &WindowsQemuCurrentOsPlan,
+    init_script: &str,
 ) -> Result<PathBuf, NoUsbError> {
     let rootfs = run_directory.join("current-os-rootfs");
     fs::create_dir(&rootfs)?;
@@ -1280,9 +1368,6 @@ fn create_disposable_current_os_root(
         &rootfs.join("etc/inittab"),
         b"::sysinit:/etc/init.d/rcS\nttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100\n::ctrlaltdel:/sbin/reboot\n::shutdown:/bin/umount -a -r\n",
     )?;
-    let init_script = format!(
-        "#!/bin/sh\n/bin/mount -t proc proc /proc 2>/dev/null || true\n/bin/mount -t sysfs sysfs /sys 2>/dev/null || true\n/bin/mount -t devtmpfs devtmpfs /dev 2>/dev/null || true\n/bin/mkdir -p /dev/pts /run /tmp\n/bin/mount -t devpts devpts /dev/pts 2>/dev/null || true\necho '{DISPOSABLE_CURRENT_OS_MARKER}'\necho 'NoUSB disposable current OS userspace is running from /dev/vda.'\n"
-    );
     let init_path = rootfs.join("etc/init.d/rcS");
     write_create_new(&init_path, init_script.as_bytes())?;
     let init_wsl = windows_to_docker_wsl_path(&init_path)?;
@@ -1338,7 +1423,7 @@ fn create_current_os_uefi_source(
     copy_create_new(&plan.mmx64, &efi.join("mmx64.efi"))?;
     copy_create_new(&plan.kernel, &boot.join("vmlinuz"))?;
     copy_create_new(&plan.initrd, &boot.join("initrd"))?;
-    let menu = "set default=0\nset timeout=0\n\nmenuentry \"NoUSB disposable current OS\" {\n    linux /boot/vmlinuz console=ttyS0,115200n8 earlyprintk=serial root=/dev/vda rootfstype=ext4 rw rootwait init=/sbin/init ---\n    initrd /boot/initrd\n}\n";
+    let menu = "set default=0\nset timeout=0\n\nmenuentry \"NoUSB disposable current OS\" {\n    linux /boot/vmlinuz console=ttyS0,115200n8 boot=local root=/dev/vda rootfstype=ext4 rw rootwait init=/sbin/init ---\n    initrd /boot/initrd\n}\n";
     let redirect = b"search --file --set=root /boot/vmlinuz\nset prefix=($root)/boot/grub\nconfigfile $prefix/grub.cfg\n";
     write_create_new(&boot_grub.join("grub.cfg"), menu.as_bytes())?;
     write_create_new(&efi.join("grub.cfg"), redirect)?;
@@ -1436,10 +1521,7 @@ fn run_disposable_current_os_boot_once(
     let mut linux_banner_observed = false;
     let mut userspace_started = false;
     while Instant::now() < deadline {
-        let serial_bytes = match fs::read(serial_log) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let serial_bytes = fs::read(serial_log).unwrap_or_default();
         let serial = String::from_utf8_lossy(&serial_bytes);
         uefi_firmware_initialized |= serial.contains("efi: EFI v2.7 by EDK II");
         linux_banner_observed |= serial.contains("Linux version");
@@ -1507,7 +1589,11 @@ pub fn run_windows_qemu_current_os_rehearsal(
     fs::create_dir(&run_directory)?;
     let firmware_vars = run_directory.join("OVMF_VARS.fd");
     copy_create_new(&plan.firmware_vars_template, &firmware_vars)?;
-    let root_disk = create_disposable_current_os_root(&run_directory, &plan)?;
+    let root_disk = create_disposable_current_os_root(
+        &run_directory,
+        &plan,
+        &disposable_current_os_baseline_init(),
+    )?;
     let boot_source = create_current_os_uefi_source(&run_directory, &plan)?;
     let first_serial_log_path = run_directory.join("first-boot-serial.log");
     let second_serial_log_path = run_directory.join("second-boot-serial.log");
@@ -2037,10 +2123,7 @@ pub fn run_windows_qemu_full_ram_rehearsal(
     let mut iso_download_started = false;
     let mut iso_download_complete = false;
     let source_stop_serial_offset = loop {
-        let serial_bytes = match fs::read(&serial_log_path) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let serial_bytes = fs::read(&serial_log_path).unwrap_or_default();
         let serial = String::from_utf8_lossy(&serial_bytes);
         linux_banner_observed |= serial.contains("Linux version");
         iso_download_started |= serial.contains("saving to 'ubuntu-24.04.4-live-server-amd64.iso'");
@@ -2079,10 +2162,7 @@ pub fn run_windows_qemu_full_ram_rehearsal(
     let mut systemd_started_after_source_stop = false;
     let mut subiquity_payload_mounted_after_source_stop = false;
     while Instant::now() < installer_deadline {
-        let serial_bytes = match fs::read(&serial_log_path) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let serial_bytes = fs::read(&serial_log_path).unwrap_or_default();
         if let Some(suffix_bytes) = serial_bytes.get(source_stop_serial_offset..) {
             let suffix = String::from_utf8_lossy(suffix_bytes);
             systemd_started_after_source_stop |=
@@ -2313,10 +2393,7 @@ pub fn run_windows_qemu_uefi_full_ram_rehearsal(
     let mut uefi_firmware_initialized = false;
     let mut linux_banner_observed = false;
     while Instant::now() < uefi_deadline {
-        let serial_bytes = match fs::read(&serial_log_path) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let serial_bytes = fs::read(&serial_log_path).unwrap_or_default();
         let serial = String::from_utf8_lossy(&serial_bytes);
         uefi_firmware_initialized |= serial.contains("efi: EFI v2.7 by EDK II");
         linux_banner_observed |= serial.contains("Linux version");
@@ -2347,10 +2424,7 @@ pub fn run_windows_qemu_uefi_full_ram_rehearsal(
 
     let download_deadline = Instant::now() + Duration::from_secs(600);
     let source_stop_serial_offset = loop {
-        let serial_bytes = match fs::read(&serial_log_path) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let serial_bytes = fs::read(&serial_log_path).unwrap_or_default();
         let serial = String::from_utf8_lossy(&serial_bytes);
         let iso_download_complete = serial.contains("'ubuntu-24.04.4-live-server-amd64.iso' saved")
             && serial.contains("Begin: Running /scripts/casper-bottom");
@@ -2389,10 +2463,7 @@ pub fn run_windows_qemu_uefi_full_ram_rehearsal(
     let mut subiquity_payload_mounted_after_http_stop = false;
     let mut serial_getty_started_after_http_stop = false;
     while Instant::now() < installer_deadline {
-        let serial_bytes = match fs::read(&serial_log_path) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let serial_bytes = fs::read(&serial_log_path).unwrap_or_default();
         if let Some(suffix_bytes) = serial_bytes.get(source_stop_serial_offset..) {
             let suffix = String::from_utf8_lossy(suffix_bytes);
             systemd_started_after_http_stop |=
@@ -2546,11 +2617,7 @@ pub fn run_windows_qemu_netboot_rehearsal(
 }
 
 fn escape_json(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+    nousb_core::escape_json(value)
 }
 
 #[cfg(test)]
@@ -2569,6 +2636,8 @@ drive_size_bytes=512110190592
 drive_format=NTFS
 system_drive=C:\
 bitlocker=1
+esp=disk 0 partition 1|209715200
+recovery_partition=1
 "#,
         );
 
@@ -2591,6 +2660,14 @@ bitlocker=1
                 .as_deref(),
             Some("C:\\")
         );
+        let hints = &inventory.boot_hints;
+        assert_eq!(hints.esp_present, Some(true));
+        assert_eq!(hints.esp_location.as_deref(), Some("disk 0 partition 1"));
+        assert_eq!(hints.esp_size_bytes, Some(209_715_200));
+        assert_eq!(hints.recovery_partition_present, Some(true));
+        assert!(hints.boot_managers[0].starts_with("Windows Boot Manager"));
+        assert_eq!(hints.network_boot_entries, None);
+        assert!(hints.unknowns.iter().any(|item| item.contains("BCD")));
     }
 
     #[cfg(target_os = "windows")]

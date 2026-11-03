@@ -1,0 +1,31 @@
+[package]
+name = "nousb-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Tauri command bridge exposing NoUSB's read-only and simulated workflows to the desktop UI"
+repository = "https://github.com/jebarson-caleb/RevX"
+rust-version = "1.87"
+publish = false
+
+# Standalone: the Rust workspace's CI must not need WebView system libraries.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.2", features = [] }
+
+[dependencies]
+nousb-core = { path = "../../../crates/nousb-core" }
+nousb-platform-linux = { path = "../../../crates/nousb-platform-linux" }
+nousb-platform-windows = { path = "../../../crates/nousb-platform-windows" }
+tauri = { version = "=2.12.3", features = [] }
+
+# Off by default. `real-boot` compiles the host one-shot backend for physical testing.
+[features]
+default = []
+real-boot = [
+    "nousb-core/real-windows-boot",
+    "nousb-core/real-linux-boot",
+    "nousb-platform-windows/real-windows-boot",
+    "nousb-platform-linux/real-linux-boot",
+]

@@ -30,6 +30,11 @@ Working pieces:
 - Typed direct-kernel full-ISO rehearsal proving the complete installer payload continues from RAM after its owned HTTP source stops, with no block devices attached.
 - Typed combined OVMF/official-UEFI/full-ISO rehearsal proving the read-only FAT boot source is deleted before the ISO transfer finishes, the HTTP source is stopped after download, Subiquity and the installer tty continue, and final QMP storage contains only firmware files.
 - Combined report truthfully records `secure_boot_enabled=false`, `guest_transport_https=false`, and `fallback_boot_observed=false` as the next safety gates.
+- Reproducible runtime: `vm qemu plan-runtime` / `bootstrap-runtime` assemble QEMU 10.1.5, OVMF, busybox, efibootmgr, GRUB, and ESP tools from signed Alpine v3.23 packages and write a manifest with package versions and signing-key digests.
+- Disposable current-OS baseline (`rehearse-current-os-baseline`), fixed to boot the live-server initrd with `boot=local`.
+- Real UEFI one-shot matrix (`rehearse-current-os-one-shot`): a disposable current OS uses `efibootmgr` to create a temporary entry outside `BootOrder` and arm `BootNext`. Firmware boots the pinned official shim/GRUB/kernel chain exactly once and falls back to the unchanged default after the forced installer failure. The guest cleans up and verifies, with power cut after every transaction step.
+- Dev builds hash the 3.2 GiB ISO in about 9 seconds (optimized `sha2` in the dev profile).
+- CI runs clippy `-D warnings` and tests on both Ubuntu and Windows.
 - Versioned TOML installer profiles under `crates/nousb-installer-profiles/profiles`.
 - Profile parser and validation for schema version, supported platforms, staging strategies, and free-space requirements.
 - Safe host inspection adapter.
@@ -47,12 +52,13 @@ Working pieces:
 - Typed no-USB delivery assessment for host-staged RAM boot, GRUB loopback, Windows Setup/WinPE, UEFI HTTP Boot, and Dell BIOSConnect comparison.
 - Explicit macOS exclusion and truthful `universal_no_usb_guarantee=false` output.
 - Docs and original prompt stored in `docs/MASTER_PROMPT.md`.
-- GitHub Actions CI workflow for Rust format and tests.
+- GitHub Actions CI workflow for Rust format, clippy, and tests on Ubuntu and Windows.
 
 Verified commands:
 
 ```sh
 cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p nousb -- doctor
 cargo run -p nousb -- tui
@@ -69,6 +75,10 @@ cargo run -p nousb -- vm qemu plan-ubuntu-full-ram
 cargo run -p nousb -- vm qemu rehearse-ubuntu-full-ram "RUN DISPOSABLE UBUNTU FULL ISO RAM REHEARSAL"
 cargo run -p nousb -- vm qemu plan-ubuntu-uefi-full-ram
 cargo run -p nousb -- vm qemu rehearse-ubuntu-uefi-full-ram "RUN DISPOSABLE UBUNTU UEFI FULL ISO RAM REHEARSAL"
+cargo run -p nousb -- vm qemu plan-runtime
+cargo run -p nousb -- vm qemu bootstrap-runtime "ASSEMBLE PROJECT-LOCAL QEMU RUNTIME"
+cargo run -p nousb -- vm qemu plan-current-os-one-shot
+cargo run -p nousb -- vm qemu rehearse-current-os-one-shot "RUN DISPOSABLE CURRENT OS UEFI ONE-SHOT MATRIX"
 cargo run -p nousb -- workflow assess-fake windows-bitlocker ubuntu-24.04-desktop
 cargo run -p nousb -- system inspect-fake windows-bitlocker
 cargo run -p nousb -- plan-fake linux-luks-low-space boot-once ubuntu-24.04-desktop
@@ -103,17 +113,26 @@ Current feature flags to preserve:
 
 ## Next Best Steps
 
-1. Add a disposable current-OS guest disk and one-shot selector to the proven UEFI/full-RAM harness, then prove a second boot returns to the original guest default.
-2. Add power-loss injection to that path and rerun the complete one-shot recovery matrix against the disposable guest disk.
-3. Enable OVMF Secure Boot for a separate signed-chain test and add a TLS-capable guest recovery endpoint; keep the current isolated HTTP proof labeled honestly.
+Done in this round: the host one-shot boot executor (`nousb boot plan | arm | status | cleanup`) behind `real-windows-boot` / `real-linux-boot`, with fake-backend transaction tests, scripted `bcdedit`/`efibootmgr` tests, the desktop "Boot once" view, and open-source release files. See `docs/PHYSICAL_TESTING.md`.
+
+- Run the physical test matrix in `docs/PHYSICAL_TESTING.md`: Windows NTFS to Ubuntu (casper reading NTFS), Linux ext4 to Ubuntu and Fedora, Secure Boot on and off. Record each run with the "Physical test report" issue template.
+- Add a WinPE-based route before claiming Windows as a target; keep Windows 11 fail-closed until then.
+- Add `@types/react` and a `tsconfig.json` so the desktop UI is type-checked in CI (Vite only transpiles today).
+
+Done in this round: the disposable current-OS guest, the real UEFI `BootNext` selector, firmware fallback, and the power-loss matrix (former steps 1 and 2); see `docs/VM_ONE_SHOT.md`.
+
+1. Join the one-shot matrix to the full-installer-in-RAM path in a single run. The installer entry boots casper with `url=` and the full verified ISO, then the run proves fallback after a later reboot.
+2. Enable OVMF Secure Boot (an Alpine/edk2 `secboot` build with enrolled Microsoft/Canonical keys) for the same matrix, and add a TLS-capable guest recovery endpoint. Keep the current isolated HTTP proof labeled honestly.
+3. Build equivalent disposable matrices for Windows BCD `bootsequence`, systemd-boot `LoaderEntryOneShot`, and GRUB `next_entry` (the state-machine rehearsals already exist).
 4. Extend read-only inspection with ESP, boot-manager, and network-boot hints; keep unknown values explicit.
 5. Add signature-chain verification and provenance metadata on top of the pinned SHA-256 manifests.
-6. Wire live guided actions and evidence into the React/Tauri command bridge.
-7. Replace hand-written JSON and CLI option parsing with `serde` and `clap`.
-8. Replace the SQLite shell-out with `rusqlite` and migrate persisted reports into the journal schema.
-9. Add resume/recover commands that consume persisted reports.
-10. Expand the safe executor into feature-gated Windows/Linux families only after VM recovery tests pass.
-11. Add package metadata and a release-signing plan.
+6. Decide whether to move the pins to Ubuntu 24.04.5 (now published beside 24.04.4). The QEMU harness pins 24.04.4 Server EFI/kernel hashes, so a bump needs new hashes and a full rerun.
+7. Wire live guided actions and evidence into the React/Tauri command bridge.
+8. Replace hand-written JSON and CLI option parsing with `serde` and `clap`.
+9. Replace the SQLite shell-out with `rusqlite` and migrate persisted reports into the journal schema.
+10. Add resume/recover commands that consume persisted reports.
+11. Expand the safe executor into feature-gated Windows/Linux families only after VM recovery tests pass.
+12. Add package metadata and a release-signing plan.
 
 ## Backlog
 
@@ -167,7 +186,7 @@ Docs:
 Paste this into a new chat:
 
 ```text
-We are continuing the NoUSB OS Switcher project in /home/jebarson/Documents/RevX.
+We are continuing the NoUSB OS Switcher project in this repository (RevX).
 Read START_HERE.md, TODO.md, docs/HANDOFF.md, AGENTS.md, README.md, and docs/MASTER_PROMPT.md first.
 Keep default builds non-destructive.
 Run cargo test --workspace before finalizing changes.

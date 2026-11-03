@@ -364,6 +364,17 @@ fn show_real_vm_evidence<W: Write>(output: &mut W, base_dir: &Path) -> Result<()
         Ok(current_os) => writeln!(output, "{}", current_os.preview())?,
         Err(error) => writeln!(output, "Disposable current-OS plan unavailable: {error}")?,
     }
+    match nousb_platform_windows::windows_qemu_one_shot_plan(
+        base_dir,
+        nousb_core::OneShotBootBackend::UefiBootNext,
+        nousb_platform_windows::OneShotInstallerMode::ForcedFailure,
+    ) {
+        Ok(one_shot) => writeln!(output, "{}", one_shot.preview())?,
+        Err(error) => writeln!(
+            output,
+            "Disposable one-shot matrix plan unavailable: {error}"
+        )?,
+    }
 
     let evidence_root = base_dir.join(".nousb").join("vm").join("qemu");
     if !evidence_root.is_dir() {

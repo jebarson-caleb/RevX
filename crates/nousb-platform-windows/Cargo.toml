@@ -3,6 +3,10 @@ name = "nousb-platform-windows"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Read-only Windows inspection adapter and disposable QEMU rehearsal harness for NoUSB OS Switcher"
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 nousb-core = { path = "../nousb-core" }

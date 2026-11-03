@@ -1,0 +1,35 @@
+name: Bug report
+description: Something in the CLI, TUI, or desktop app does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: For security problems, use private vulnerability reporting instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build
+      options: ["Default (safe)", "real-windows-boot", "real-linux-boot", "Desktop real-boot"]
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host OS
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce and what happened
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Command output
+      render: text

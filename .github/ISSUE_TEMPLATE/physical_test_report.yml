@@ -1,0 +1,69 @@
+name: Physical test report
+description: Results of `nousb boot arm` on real hardware (docs/PHYSICAL_TESTING.md)
+labels: ["physical-test"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for testing on real hardware. Remove serial numbers or anything else you consider private.
+  - type: input
+    id: machine
+    attributes:
+      label: Machine and firmware
+      description: Make, model, firmware/BIOS version
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host OS
+      options: ["Windows 11", "Windows 10", "Ubuntu", "Fedora", "Other Linux"]
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Target profile
+      placeholder: ubuntu-24.04-desktop
+    validations:
+      required: true
+  - type: dropdown
+    id: secure_boot
+    attributes:
+      label: Secure Boot
+      options: ["On", "Off", "Unknown"]
+  - type: input
+    id: staging
+    attributes:
+      label: Staging volume and filesystem
+      placeholder: "C:\\ NTFS, unencrypted"
+  - type: dropdown
+    id: result
+    attributes:
+      label: Furthest point reached
+      options:
+        - Arm failed (rolled back)
+        - Firmware ignored the one-shot entry
+        - Secure Boot violation
+        - Stopped at a GRUB prompt or error
+        - Kernel started, live system did not find its medium
+        - Live system started
+    validations:
+      required: true
+  - type: dropdown
+    id: fallback
+    attributes:
+      label: Did the next boot return to the original OS?
+      options: ["Yes", "No", "Not tested"]
+    validations:
+      required: true
+  - type: dropdown
+    id: cleanup
+    attributes:
+      label: Did `nousb boot cleanup` leave the boot order identical to the backup?
+      options: ["Yes", "No", "Not run"]
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: "`nousb --json boot plan <profile>`, `nousb boot status`, and any error text"
+      render: text

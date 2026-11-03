@@ -2,16 +2,18 @@
 use nousb_core::HostPlatform;
 mod tui;
 use nousb_core::{
-    acquire_qemu_windows_runtime, artifact_manifest, assess_delivery, built_in_profiles,
+    acquire_qemu_windows_runtime, arm_host_one_shot, artifact_cache_path, artifact_manifest,
+    assess_delivery, assess_recovery, built_in_profiles, cleanup_host_one_shot,
     create_recovery_pack, create_staging_bundle, download_artifact, embedded_profiles,
     execute_plan_safe, export_diagnostic_bundle, inspect_staging_artifact,
-    list_saved_execution_reports, load_execution_report_json, plan_operation,
-    plan_operation_for_inventory, probe_artifact, qemu_runtime_cache_path,
-    qemu_windows_runtime_manifest, rehearse_vm_one_shot, rollback_simulated_report,
-    save_execution_report, save_vm_rehearsal, verify_artifact, verify_sha256_with_system_tool,
-    write_journal_entry, FakePlatformAdapter, NoUsbError, OneShotBootBackend, OperationExecutor,
-    OperationKind, PlatformAdapter, SavedExecutionReportSummary, SimulatedExecutor,
-    SimulationConfig, SystemInventory,
+    list_saved_execution_reports, load_execution_report, load_execution_report_json,
+    load_host_boot_state, plan_host_one_shot, plan_operation, plan_operation_for_inventory,
+    probe_artifact, qemu_runtime_cache_path, qemu_windows_runtime_manifest, rehearse_vm_one_shot,
+    resume_simulated_report, rollback_simulated_report, save_execution_report, save_vm_rehearsal,
+    verify_artifact, verify_sha256_with_system_tool, write_journal_entry, FakePlatformAdapter,
+    HostBootBackend, HostBootFacts, HostBootPlan, NoUsbError, OneShotBootBackend,
+    OperationExecutor, OperationKind, PlatformAdapter, RecoveryAction, SavedExecutionReportSummary,
+    SimulatedExecutor, SimulationConfig, SystemInventory, CLEANUP_CONFIRMATION_PHRASE,
 };
 use std::env;
 use std::fs;
@@ -69,6 +71,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "available_space_gb: {:?}",
                     inventory.disk_inventory.available_space_gb
                 );
+                for line in inventory.boot_hints.preview_lines() {
+                    println!("boot_hint: {line}");
+                }
                 for warning in inventory.warnings {
                     println!("warning: {warning}");
                 }
@@ -92,6 +97,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     inventory.disk_inventory.available_space_gb
                 );
                 println!("capabilities: {:?}", adapter.capabilities());
+                for line in inventory.boot_hints.preview_lines() {
+                    println!("boot_hint: {line}");
+                }
                 for warning in inventory.warnings {
                     println!("warning: {warning}");
                 }
@@ -242,6 +250,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("sha256: {}", manifest.sha256);
             }
         }
+        [cmd, sub, profile] if cmd == "image" && sub == "verify-signature" => {
+            let verification = nousb_core::verify_profile_signature(profile)?;
+            write_journal_entry(
+                &cwd,
+                &format!(
+                    "verified vendor signature profile={} key={} pinned_digest_signed={}",
+                    verification.profile_id,
+                    verification.key_fingerprint,
+                    verification.pinned_digest_signed
+                ),
+            )?;
+            if options.json {
+                println!("{}", verification.to_json());
+            } else {
+                println!("profile: {}", verification.profile_id);
+                println!(
+                    "signing key: {} ({})",
+                    verification.key_id, verification.key_fingerprint
+                );
+                println!("checksum document: {}", verification.checksum_url);
+                if let Some(signature_url) = &verification.signature_url {
+                    println!("detached signature: {signature_url}");
+                }
+                println!("signature_valid: {}", verification.signature_valid);
+                println!(
+                    "pinned sha256 {} is vendor-signed for {}: {}",
+                    verification.pinned_sha256,
+                    verification.artifact_filename,
+                    verification.pinned_digest_signed
+                );
+            }
+        }
         [cmd, sub, profile] if cmd == "image" && sub == "probe" => {
             let probe = probe_artifact(profile)?;
             if options.json {
@@ -322,11 +362,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("execution_enabled: {}", bundle.execution_enabled);
             }
         }
+        [cmd, sub] if cmd == "journal" && sub == "migrate" => {
+            let migration = nousb_core::migrate_saved_reports(&cwd)?;
+            if options.json {
+                println!("{}", migration.to_json());
+            } else {
+                println!("journal: {}", migration.database.display());
+                println!("schema_version: {}", migration.schema_version);
+                println!("imported_reports: {}", migration.imported_reports);
+                for skipped in &migration.skipped {
+                    println!("skipped: {skipped}");
+                }
+            }
+        }
         [cmd, sub] if cmd == "logs" && sub == "export" => {
-            let sqlite_path = cwd
-                .join(".nousb")
-                .join("journal")
-                .join("operation_journal.sqlite3");
+            let sqlite_path = nousb_core::journal_database_path(&cwd);
             let log_path = cwd.join(".nousb").join("journal").join("operations.log");
             if sqlite_path.exists() {
                 println!("{}", sqlite_path.display());
@@ -357,6 +407,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         [cmd, sub, plan_id] if cmd == "reports" && sub == "show" => {
             let report = load_execution_report_json(&cwd, plan_id)?;
             println!("{report}");
+        }
+        [cmd, sub, plan_id] if cmd == "reports" && sub == "recover" => {
+            let report = load_execution_report(&cwd, plan_id)?;
+            let assessment = assess_recovery(&report);
+            if options.json {
+                println!("{}", assessment.to_json());
+            } else {
+                println!("{}", assessment.preview());
+                println!(
+                    "Saved reports come from simulations; no host boot state was read or changed."
+                );
+            }
+        }
+        [cmd, plan_id] if cmd == "resume" => {
+            let report = load_execution_report(&cwd, plan_id)?;
+            let resumed = resume_simulated_report(&report)?;
+            let path = save_execution_report(&cwd, &resumed)?;
+            write_journal_entry(
+                &cwd,
+                &format!(
+                    "resumed simulated operation {plan_id} report={}",
+                    path.display()
+                ),
+            )?;
+            print_execution_report(&resumed, options.json);
+            if !options.json {
+                println!("Saved report: {}", path.display());
+            }
         }
         [cmd, sub] if cmd == "diagnostics" && sub == "export" => {
             let (inventory, _) = inspect_host()?;
@@ -693,6 +771,175 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("trust_level: {}", report.trust_level);
             }
         }
+        [cmd, scope, sub] if cmd == "vm" && scope == "qemu" && sub == "plan-secure-boot" => {
+            let plan = nousb_platform_windows::windows_qemu_secure_boot_plan(&cwd)?;
+            if options.json {
+                println!("{}", plan.to_json());
+            } else {
+                println!("{}", plan.preview());
+            }
+        }
+        [cmd, scope, sub, confirmation]
+            if cmd == "vm" && scope == "qemu" && sub == "rehearse-secure-boot" =>
+        {
+            let plan = nousb_platform_windows::windows_qemu_secure_boot_plan(&cwd)?;
+            if !options.json {
+                println!("{}", plan.preview());
+                println!("Starting only after exact typed confirmation was supplied.");
+            }
+            let report =
+                nousb_platform_windows::run_windows_qemu_secure_boot_rehearsal(&cwd, confirmation)?;
+            write_journal_entry(
+                &cwd,
+                &format!(
+                    "completed disposable Secure Boot rehearsal report={} secure_boot={} signed_chain_accepted={} unsigned_loader_rejected={} host_boot_changes=false",
+                    report.report_path.display(),
+                    report.secure_boot_enabled,
+                    report.signed_chain_accepted,
+                    report.unsigned_loader_rejected,
+                ),
+            )?;
+            if options.json {
+                println!("{}", report.to_json());
+            } else {
+                println!("Disposable Secure Boot rehearsal completed.");
+                println!("report: {}", report.report_path.display());
+                println!("secure_boot_enabled: {}", report.secure_boot_enabled);
+                println!("signed_chain_accepted: {}", report.signed_chain_accepted);
+                println!(
+                    "unsigned_loader_rejected: {}",
+                    report.unsigned_loader_rejected
+                );
+                println!("host_boot_changes: {}", report.host_boot_changes);
+            }
+        }
+        [cmd, scope, sub] if cmd == "vm" && scope == "qemu" && sub == "plan-runtime" => {
+            let plan = nousb_platform_windows::windows_qemu_runtime_bootstrap_plan(&cwd)?;
+            if options.json {
+                println!("{}", plan.to_json());
+            } else {
+                println!("{}", plan.preview());
+            }
+        }
+        [cmd, scope, sub, confirmation]
+            if cmd == "vm" && scope == "qemu" && sub == "bootstrap-runtime" =>
+        {
+            let plan = nousb_platform_windows::windows_qemu_runtime_bootstrap_plan(&cwd)?;
+            if !options.json {
+                println!("{}", plan.preview());
+                println!("Starting only after exact typed confirmation was supplied.");
+            }
+            let report =
+                nousb_platform_windows::run_windows_qemu_runtime_bootstrap(&cwd, confirmation)?;
+            write_journal_entry(
+                &cwd,
+                &format!(
+                    "bootstrapped project-local QEMU runtime manifest={} qemu={} packages={} installs_into_windows=false host_boot_changes=false",
+                    report.manifest_path.display(),
+                    report.qemu_version,
+                    report.installed_packages.len(),
+                ),
+            )?;
+            if options.json {
+                println!("{}", report.to_json());
+            } else {
+                println!("Project-local QEMU runtime ready.");
+                println!("runtime: {}", report.runtime_root.display());
+                println!("manifest: {}", report.manifest_path.display());
+                println!("qemu_version: {}", report.qemu_version);
+                println!("packages: {}", report.installed_packages.len());
+                println!("runtime_was_present: {}", report.runtime_was_present);
+                println!("installs_into_windows: {}", report.installs_into_windows);
+                println!("host_boot_changes: {}", report.host_boot_changes);
+            }
+        }
+        [cmd, scope, sub, rest @ ..]
+            if cmd == "vm"
+                && scope == "qemu"
+                && sub == "plan-current-os-one-shot"
+                && rest.len() <= 2 =>
+        {
+            let arguments = parse_one_shot_arguments(rest)?;
+            let plan = nousb_platform_windows::windows_qemu_one_shot_plan(
+                &cwd,
+                arguments.backend,
+                arguments.mode,
+            )?;
+            if options.json {
+                println!("{}", plan.to_json());
+            } else {
+                println!("{}", plan.preview());
+            }
+        }
+        [cmd, scope, sub, confirmation, rest @ ..]
+            if cmd == "vm"
+                && scope == "qemu"
+                && sub == "rehearse-current-os-one-shot"
+                && rest.len() <= 3 =>
+        {
+            let arguments = parse_one_shot_arguments(rest)?;
+            let backend = arguments.backend;
+            let plan =
+                nousb_platform_windows::windows_qemu_one_shot_plan(&cwd, backend, arguments.mode)?;
+            if !options.json {
+                println!("{}", plan.preview());
+                println!("Starting only after exact typed confirmation was supplied.");
+            }
+            let report = nousb_platform_windows::run_windows_qemu_one_shot_rehearsal(
+                &cwd,
+                confirmation,
+                backend,
+                arguments.mode,
+                arguments.scenario,
+            )?;
+            write_journal_entry(
+                &cwd,
+                &format!(
+                    "completed disposable current-OS one-shot rehearsal backend={} report={} scenarios={} selection={} installer_fallback={} power_loss_matrix={} secure_boot=false physical_disks=false network=false host_boot_changes=false",
+                    backend,
+                    report.report_path.display(),
+                    report.scenarios.len(),
+                    report.one_shot_selection_proven,
+                    report.installer_fallback_proven,
+                    report.power_loss_matrix_complete,
+                ),
+            )?;
+            if options.json {
+                println!("{}", report.to_json());
+            } else {
+                println!("Disposable current-OS UEFI one-shot rehearsal completed.");
+                println!("report: {}", report.report_path.display());
+                for scenario in &report.scenarios {
+                    println!(
+                        "scenario {}: passed={} power_cycles={} power_cut={} installer_boots={}",
+                        scenario.point,
+                        scenario.passed(),
+                        scenario.power_cycles,
+                        scenario.power_cut_applied,
+                        scenario.evaluation.installer_boots,
+                    );
+                }
+                println!(
+                    "one_shot_selection_proven: {}",
+                    report.one_shot_selection_proven
+                );
+                println!(
+                    "installer_fallback_proven: {}",
+                    report.installer_fallback_proven
+                );
+                println!(
+                    "power_loss_matrix_complete: {}",
+                    report.power_loss_matrix_complete
+                );
+                println!("secure_boot_enabled: {}", report.secure_boot_enabled);
+                println!(
+                    "full_installer_payload_in_ram: {}",
+                    report.full_installer_payload_in_ram
+                );
+                println!("host_boot_changes: {}", report.host_boot_changes);
+                println!("trust_level: {}", report.trust_level);
+            }
+        }
         [cmd, scope, sub] if cmd == "vm" && scope == "qemu" && sub == "acquire" => {
             let download = acquire_qemu_windows_runtime(&cwd)?;
             write_journal_entry(
@@ -739,14 +986,87 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (inventory, _) = inspect_host()?;
             if options.json {
                 println!(
-                    "{{\"safe_default_build\":\"ok\",\"host\":\"{} {}\",\"real_boot_adapters\":\"disabled\"}}",
-                    inventory.os_name, inventory.arch
+                    "{{\"safe_default_build\":\"ok\",\"host\":\"{} {}\",\"real_boot_adapters\":\"{}\"}}",
+                    inventory.os_name,
+                    inventory.arch,
+                    if real_boot_compiled() { "compiled-in" } else { "disabled" }
                 );
             } else {
                 println!("NoUSB doctor");
                 println!("safe default build: ok");
                 println!("host: {} {}", inventory.os_name, inventory.arch);
-                println!("real boot adapters: disabled");
+                println!(
+                    "real boot adapters: {}",
+                    if real_boot_compiled() {
+                        "compiled in (typed confirmation required; see nousb boot plan)"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
+        }
+        [cmd, sub, profile] if cmd == "boot" && sub == "plan" => {
+            let plan = host_boot_plan(&cwd, profile, &options)?;
+            if options.json {
+                println!("{}", plan.to_json());
+            } else {
+                print!("{}", plan.preview());
+            }
+        }
+        [cmd, sub, profile, confirmation] if cmd == "boot" && sub == "arm" => {
+            let plan = host_boot_plan(&cwd, profile, &options)?;
+            if options.dry_run {
+                print!("{}", plan.preview());
+                return Ok(());
+            }
+            let mut backend = real_boot_backend()?;
+            let state = arm_host_one_shot(&cwd, &plan, backend.as_mut(), confirmation)?;
+            if options.json {
+                println!("{}", state.to_json());
+            } else {
+                println!(
+                    "Armed: {} will start once on the next reboot.",
+                    plan.profile_name
+                );
+                println!(
+                    "Firmware entry: {}",
+                    state.entry_id.as_deref().unwrap_or("?")
+                );
+                println!("Reboot when ready ({}).", reboot_hint());
+                println!(
+                    "Back in this OS afterwards, run: nousb boot cleanup \"{CLEANUP_CONFIRMATION_PHRASE}\""
+                );
+            }
+        }
+        [cmd, sub] if cmd == "boot" && sub == "status" => {
+            let state = load_host_boot_state(&cwd)?;
+            match (state, options.json) {
+                (Some(state), true) => println!("{}", state.to_json()),
+                (None, true) => println!("null"),
+                (Some(state), false) => {
+                    println!("Transaction: {}", state.plan_id);
+                    println!("Profile: {}", state.profile_id);
+                    println!("Phase: {:?}", state.phase);
+                    println!(
+                        "Firmware entry: {}",
+                        state.entry_id.as_deref().unwrap_or("none")
+                    );
+                    println!("Needs cleanup: {}", state.needs_cleanup());
+                    let skip = state.events.len().saturating_sub(8);
+                    for event in state.events.iter().skip(skip) {
+                        println!("  {event}");
+                    }
+                }
+                (None, false) => println!("No host boot transaction is recorded."),
+            }
+        }
+        [cmd, sub, confirmation] if cmd == "boot" && sub == "cleanup" => {
+            let mut backend = real_boot_backend()?;
+            let state = cleanup_host_one_shot(&cwd, backend.as_mut(), confirmation)?;
+            if options.json {
+                println!("{}", state.to_json());
+            } else {
+                println!("Cleanup complete: {:?}", state.phase);
             }
         }
         [cmd, plan_kind, profile] if cmd == "execute" => {
@@ -763,10 +1083,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("execute now expects <plan-kind> <profile>; got {plan_id}").into());
         }
         [cmd, operation_id] if cmd == "rollback" => {
-            return Err(format!(
-                "automatic rollback for {operation_id} requires a real adapter journal; see recovery pack"
-            )
-            .into());
+            let report = load_execution_report(&cwd, operation_id).map_err(|_| {
+                format!(
+                    "no saved report for {operation_id}; rollback of real operations requires a real adapter journal; see recovery pack"
+                )
+            })?;
+            let assessment = assess_recovery(&report);
+            if !matches!(
+                assessment.recommended,
+                RecoveryAction::Rollback | RecoveryAction::Resume
+            ) {
+                return Err(format!(
+                    "{operation_id} needs no automatic rollback (recommended: {})",
+                    assessment.recommended.as_str()
+                )
+                .into());
+            }
+            let rolled_back = rollback_simulated_report(&report);
+            let path = save_execution_report(&cwd, &rolled_back)?;
+            write_journal_entry(
+                &cwd,
+                &format!(
+                    "rolled back simulated operation {operation_id} report={}",
+                    path.display()
+                ),
+            )?;
+            print_execution_report(&rolled_back, options.json);
+            if !options.json {
+                println!("Saved report: {}", path.display());
+            }
         }
         _ => {
             print_help();
@@ -774,6 +1119,142 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Optional `[backend] [installer-mode] [scenario]` arguments of the disposable one-shot
+/// commands, in any order. Backend ids, installer modes, and scenario names never overlap.
+fn parse_one_shot_arguments(
+    arguments: &[String],
+) -> Result<OneShotArguments, Box<dyn std::error::Error>> {
+    let mut backend = None;
+    let mut mode = None;
+    let mut scenario = None;
+    for argument in arguments {
+        if let Some(parsed) = nousb_platform_windows::OneShotInstallerMode::parse(argument) {
+            if mode.replace(parsed).is_some() {
+                return Err("give at most one installer mode".into());
+            }
+        } else if let Ok(parsed) = OneShotBootBackend::parse(argument) {
+            if backend.replace(parsed).is_some() {
+                return Err("give at most one one-shot backend".into());
+            }
+        } else {
+            let parsed = nousb_platform_windows::OneShotPowerLossPoint::parse(argument)?;
+            if scenario.replace(parsed).is_some() {
+                return Err("give at most one one-shot scenario".into());
+            }
+        }
+    }
+    Ok(OneShotArguments {
+        backend: backend.unwrap_or(OneShotBootBackend::UefiBootNext),
+        mode: mode.unwrap_or(nousb_platform_windows::OneShotInstallerMode::ForcedFailure),
+        scenario,
+    })
+}
+
+struct OneShotArguments {
+    backend: OneShotBootBackend,
+    mode: nousb_platform_windows::OneShotInstallerMode,
+    scenario: Option<nousb_platform_windows::OneShotPowerLossPoint>,
+}
+
+fn staging_root(options: &CliOptions) -> PathBuf {
+    if let Some(root) = &options.staging_root {
+        return root.clone();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        nousb_platform_windows::default_windows_staging_root()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        nousb_platform_linux::default_linux_staging_root()
+    }
+}
+
+fn read_host_boot_facts(root: &Path) -> Result<HostBootFacts, NoUsbError> {
+    #[cfg(target_os = "windows")]
+    {
+        nousb_platform_windows::windows_host_boot_facts(root)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        nousb_platform_linux::linux_host_boot_facts(&mut nousb_core::SystemCommandRunner, root)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Err(NoUsbError::UnsafeExecution(format!(
+            "host boot is supported on Windows and Linux only (staging root {})",
+            root.display()
+        )))
+    }
+}
+
+/// True only in builds with the real boot backend for this host OS.
+fn real_boot_compiled() -> bool {
+    cfg!(any(
+        all(target_os = "windows", feature = "real-windows-boot"),
+        all(target_os = "linux", feature = "real-linux-boot")
+    ))
+}
+
+fn host_boot_backend_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows-bcdedit-bootsequence"
+    } else {
+        "linux-efibootmgr-bootnext"
+    }
+}
+
+fn reboot_hint() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "use Restart, not Shut down, or run: shutdown /r /t 0"
+    } else {
+        "systemctl reboot"
+    }
+}
+
+fn host_boot_plan(
+    cwd: &Path,
+    profile: &str,
+    options: &CliOptions,
+) -> Result<HostBootPlan, Box<dyn std::error::Error>> {
+    let iso = match &options.iso {
+        Some(path) => path.clone(),
+        None => artifact_cache_path(cwd, profile)?,
+    };
+    let facts = read_host_boot_facts(&staging_root(options))?;
+    Ok(plan_host_one_shot(
+        profile,
+        &iso,
+        &facts,
+        host_boot_backend_name(),
+        real_boot_compiled(),
+    )?)
+}
+
+/// The real backend for this host. Absent unless built with the matching real-boot feature.
+fn real_boot_backend() -> Result<Box<dyn HostBootBackend>, Box<dyn std::error::Error>> {
+    #[cfg(all(target_os = "windows", feature = "real-windows-boot"))]
+    {
+        Ok(Box::new(
+            nousb_platform_windows::WindowsHostBootBackend::new(nousb_core::SystemCommandRunner),
+        ))
+    }
+    #[cfg(all(target_os = "linux", feature = "real-linux-boot"))]
+    {
+        Ok(Box::new(nousb_platform_linux::LinuxHostBootBackend::new(
+            nousb_core::SystemCommandRunner,
+            nousb_platform_linux::mounted_esp(),
+        )))
+    }
+    #[cfg(not(any(
+        all(target_os = "windows", feature = "real-windows-boot"),
+        all(target_os = "linux", feature = "real-linux-boot")
+    )))]
+    {
+        Err("this nousb build has no real boot backend (safe default build). Build with --features real-windows-boot or real-linux-boot for physical testing; see docs/PHYSICAL_TESTING.md".into())
+    }
 }
 
 fn parse_plan_kind(value: &str) -> Result<OperationKind, Box<dyn std::error::Error>> {
@@ -790,12 +1271,12 @@ fn inspect_host() -> Result<(SystemInventory, &'static str), NoUsbError> {
     #[cfg(target_os = "windows")]
     {
         let adapter = nousb_platform_windows::WindowsSafeAdapter;
-        return Ok((adapter.inspect()?, adapter.name()));
+        Ok((adapter.inspect()?, adapter.name()))
     }
     #[cfg(target_os = "linux")]
     {
         let adapter = nousb_platform_linux::LinuxSafeAdapter;
-        return Ok((adapter.inspect()?, adapter.name()));
+        Ok((adapter.inspect()?, adapter.name()))
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
@@ -965,12 +1446,7 @@ fn load_qemu_reports_json(base_dir: &Path) -> io::Result<Vec<String>> {
 }
 
 fn escape_json_for_cli(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    nousb_core::escape_json(value)
 }
 
 struct CliOptions {
@@ -980,6 +1456,8 @@ struct CliOptions {
     rollback: bool,
     interrupt_after: Option<usize>,
     fail_step: Option<String>,
+    iso: Option<PathBuf>,
+    staging_root: Option<PathBuf>,
     args: Vec<String>,
 }
 
@@ -991,6 +1469,8 @@ impl CliOptions {
         let mut rollback = false;
         let mut interrupt_after = None;
         let mut fail_step = None;
+        let mut iso = None;
+        let mut staging_root = None;
         let mut args = Vec::new();
         let mut index = 0usize;
 
@@ -1015,6 +1495,17 @@ impl CliOptions {
                     };
                     fail_step = Some(value.clone());
                 }
+                "--iso" | "--staging-root" => {
+                    index += 1;
+                    let Some(value) = raw_args.get(index) else {
+                        return Err(format!("{arg} requires a path").into());
+                    };
+                    if arg == "--iso" {
+                        iso = Some(PathBuf::from(value));
+                    } else {
+                        staging_root = Some(PathBuf::from(value));
+                    }
+                }
                 "--" => {}
                 value if value.starts_with('-') => {
                     return Err(format!("unknown option: {value}").into());
@@ -1031,6 +1522,8 @@ impl CliOptions {
             rollback,
             interrupt_after,
             fail_step,
+            iso,
+            staging_root,
             args,
         })
     }
@@ -1095,6 +1588,11 @@ fn print_vm_doctor(cwd: &Path, json: bool) {
                 .map(|plan| plan.runtime_version.as_str())
                 .unwrap_or("not prepared")
         );
+        if project_local_runtime.is_none() && cfg!(target_os = "windows") {
+            println!(
+                "Prepare it with: nousb vm qemu plan-runtime, then nousb vm qemu bootstrap-runtime \"ASSEMBLE PROJECT-LOCAL QEMU RUNTIME\""
+            );
+        }
         println!(
             "Latest real-VM evidence: {}",
             real_vm_evidence
@@ -1156,6 +1654,7 @@ fn print_help() {
     println!("  nousb workflow assess-fake <scenario> <profile>");
     println!("  nousb image manifest <profile>");
     println!("  nousb image probe <profile>");
+    println!("  nousb image verify-signature <profile>");
     println!("  nousb image download <profile>");
     println!("  nousb image verify-profile <profile> <path>");
     println!("  nousb image verify <path> <sha256>");
@@ -1164,6 +1663,8 @@ fn print_help() {
     println!("  nousb vm doctor");
     println!("  nousb vm qemu manifest");
     println!("  nousb vm qemu acquire");
+    println!("  nousb vm qemu plan-runtime");
+    println!("  nousb vm qemu bootstrap-runtime \"ASSEMBLE PROJECT-LOCAL QEMU RUNTIME\"");
     println!("  nousb vm qemu plan-smoke");
     println!("  nousb vm qemu smoke \"RUN DISPOSABLE QEMU UEFI SMOKE\"");
     println!("  nousb vm qemu plan-ubuntu-netboot");
@@ -1182,6 +1683,12 @@ fn print_help() {
     println!(
         "  nousb vm qemu rehearse-current-os-baseline \"RUN DISPOSABLE CURRENT OS UEFI BASELINE\""
     );
+    println!("  nousb vm qemu plan-secure-boot");
+    println!("  nousb vm qemu rehearse-secure-boot \"RUN DISPOSABLE SECURE BOOT REHEARSAL\"");
+    println!("  nousb vm qemu plan-current-os-one-shot [uefi-bootnext|linux-grub-reboot] [forced-failure|full-ram-installer]");
+    println!(
+        "  nousb vm qemu rehearse-current-os-one-shot \"RUN DISPOSABLE CURRENT OS UEFI ONE-SHOT MATRIX\" [backend] [installer-mode] [scenario]"
+    );
     println!("  nousb vm rehearse <backend> <profile>");
     println!("  nousb plan boot-once <profile>");
     println!("  nousb plan dual-boot <profile>");
@@ -1192,12 +1699,21 @@ fn print_help() {
     println!("  nousb simulate-fake <scenario> <plan-kind> <profile>");
     println!("  nousb reports list");
     println!("  nousb reports show <plan-id>");
+    println!("  nousb reports recover <plan-id>");
+    println!("  nousb resume <plan-id>");
     println!("  nousb diagnostics export");
     println!("  nousb dashboard export");
+    println!("  nousb boot plan <profile> [--iso <path>] [--staging-root <volume-root>]");
+    println!(
+        "  nousb boot arm <profile> \"BOOT ONCE INTO <profile>\"  (real-boot build, elevated)"
+    );
+    println!("  nousb boot status");
+    println!("  nousb boot cleanup \"{CLEANUP_CONFIRMATION_PHRASE}\"");
     println!("  nousb execute <plan-kind> <profile>");
     println!("  nousb rollback <operation-id>");
     println!("  nousb recovery-pack create");
     println!("  nousb logs export");
+    println!("  nousb journal migrate");
     println!("  nousb doctor");
     println!();
     println!("Options:");
@@ -1207,6 +1723,8 @@ fn print_help() {
     println!("  --interrupt-after <count>");
     println!("  --fail-step <step-id>");
     println!("  --rollback   Roll back the simulated report");
+    println!("  --iso <path>             ISO for boot plan/arm (default: .nousb/artifacts/...)");
+    println!("  --staging-root <root>    Unencrypted volume root for the ISO copy (C:\\ or /)");
     println!();
     println!("Fake scenarios:");
     println!("  windows-bitlocker");

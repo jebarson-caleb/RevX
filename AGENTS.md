@@ -8,6 +8,8 @@ Build safety first. The default workspace must remain non-destructive and must n
 - Test: `cargo test --workspace`
 - CLI smoke test: `cargo run -p nousb -- doctor`
 - CLI plan preview: `cargo run -p nousb -- plan boot-once ubuntu-24.04-desktop`
+- Host one-shot preview: `cargo run -p nousb -- boot plan ubuntu-24.04-desktop`
+- Feature lint: `cargo clippy -p nousb --all-targets --features real-linux-boot -- -D warnings` (or `real-windows-boot` on Windows)
 
 ## Standards
 
