@@ -22,13 +22,48 @@ What it does **not** do: it never partitions, formats, resizes, or decrypts anyt
 | --- | --- | --- |
 | Windows 10/11, UEFI, unencrypted staging volume | Ubuntu 24.04.4 Desktop/Server (casper) | Implemented. **Physical test needed:** casper must mount NTFS from its initramfs to find the ISO |
 | Windows 10/11, UEFI | Fedora 44 (dracut) | Blocked on NTFS (dracut cannot loop-mount from NTFS); use an exFAT/FAT32/ext4 staging volume with `--staging-root` |
-| Linux, UEFI, ext4/btrfs/xfs root without LUKS | Ubuntu 24.04.4, Fedora 44 | Implemented. Uses the same `efibootmgr` sequence as the passing disposable-VM matrix |
+| Linux, UEFI, ext4/btrfs/xfs root without LUKS | Ubuntu 24.04.4, Fedora 44 | Implemented. The full `nousb boot arm` → one boot → return → `cleanup` cycle passes in disposable VMs from Ubuntu, Fedora, and Debian (see below). Needs `efibootmgr` installed; the plan blocks without it |
 | BitLocker- or LUKS-encrypted staging volume | any | Blocked: GRUB cannot read it. Use another unencrypted volume with `--staging-root` |
 | Legacy BIOS / CSM | any | Blocked |
 | any | Windows 11 | Not supported: Microsoft issues only per-session download links that cannot be pinned, and booting Windows Setup without media needs a WinPE flow that does not exist yet |
 | macOS | any | Out of scope |
 
 So "any OS to any OS" is **not** true today. The tested direction is Windows or Linux to an official Linux live installer.
+
+## Disposable-VM evidence for Linux hosts
+
+`scripts/vm/linux_host_boot_rehearsal.py` runs the real `real-linux-boot` binary inside a disposable KVM + OVMF guest. The guest is an official cloud image on a throwaway qcow2 overlay with a private copy of the OVMF variable store. No host disk, ESP, or firmware variable is attached. Each run:
+
+1. Reboots once so the baseline `BootCurrent`/`BootOrder` is the steady-state default.
+2. Checks that `boot arm` refuses a wrong phrase, then arms with the typed phrase and requires an unchanged `BootOrder` and a set `BootNext`.
+3. Reboots. The host requires proof that the live installer is running: the live system's `/proc/cmdline` with `iso-scan/filename=` and a tmpfs `/cdrom`, or an OCR'd installer screen. It records the bytes read from the guest disk, which shows the full ISO was copied to RAM.
+4. Resets the VM, the equivalent of rebooting from the live system without installing.
+5. In the guest, requires the original `BootCurrent`, an unchanged `BootOrder`, no pending `BootNext`, then a successful `boot cleanup` that leaves no NoUSB firmware entry, ESP file, or staging directory.
+
+```sh
+cargo build --release -p nousb --features real-linux-boot --target x86_64-unknown-linux-musl
+python3 scripts/vm/linux_host_boot_rehearsal.py --profile ubuntu-24.04-server \
+  --nousb target/x86_64-unknown-linux-musl/release/nousb \
+  --iso .nousb/artifacts/ubuntu-24.04-server/ubuntu-24.04.4-live-server-amd64.iso \
+  --cloud-image ubuntu-24.04-server-cloudimg-amd64.img [--memory 12G] \
+  [--secure-boot-vars OVMF_VARS-with-Microsoft-keys.fd]
+```
+
+Results on 2026-11-07 (QEMU 11.1.2, KVM, edk2 OVMF 4M, `nousb` built from `main`):
+
+| Current OS (staging filesystem) | Ubuntu 24.04.4 Server | Ubuntu 24.04.4 Desktop | Fedora 44 Workstation |
+| --- | --- | --- | --- |
+| Ubuntu 24.04 cloud (ext4) | pass | pass | pass |
+| Fedora 44 Cloud (btrfs subvolume `/root`) | pass | pass | pass |
+| Debian 13 genericcloud (ext4, no `efibootmgr` preinstalled) | pass | pass | pass |
+
+Installer evidence per target: Server showed Subiquity's language screen with the ISO in RAM (`/cdrom` on tmpfs, 3.3 GiB read). Desktop showed "Welcome to Ubuntu" with 6.3 GiB read. Fedora showed "Welcome to Fedora Linux" through dracut `iso-scan` plus `rd.live.ram=1`, with 2.6 GiB read.
+
+Secure Boot: with `OVMF_CODE.secboot.4m.fd` and a variable store holding the Microsoft KEKs, Windows Production PCA 2011, and UEFI CA 2011/2023 (built with `virt-fw-vars --enroll-microsoft --secure-boot`), Ubuntu, Fedora, and Debian → Ubuntu Server passed, and Ubuntu → Fedora 44 passed. The guest kernel reported `Secure boot enabled` and lockdown, and firmware accepted each ISO's own signed shim from `\EFI\NoUSB\` without a MokManager prompt.
+
+Before the `efibootmgr` blocker existed, Debian (no `efibootmgr` preinstalled) planned `Ready: yes`, then `boot arm` failed at its first step and rolled back cleanly. The rehearsal now requires the plan to name the missing tool before installing it.
+
+What this does not prove: firmware other than OVMF, NTFS staging, BitLocker or LUKS hosts, Windows hosts, or installing an OS. Physical testing on real hardware is still required.
 
 ## Before you start
 
