@@ -29,6 +29,7 @@ cargo run -p nousb -- vm qemu plan-smoke
 cargo run -p nousb -- vm qemu plan-ubuntu-netboot
 cargo run -p nousb -- vm qemu plan-ubuntu-full-ram
 cargo run -p nousb -- vm qemu plan-ubuntu-uefi-full-ram
+cargo run -p nousb -- vm qemu plan-current-os-one-shot
 cargo run -p nousb -- workflow assess-fake windows-bitlocker ubuntu-24.04-desktop
 cargo run -p nousb -- --json plan boot-once ubuntu-24.04-desktop
 cargo run -p nousb -- dashboard export
@@ -40,19 +41,21 @@ Use the `Next Best Steps` section in `TODO.md` as the active project queue.
 
 Current highest-value next tasks:
 
-1. Add a disposable current-OS guest disk and prove a real one-shot return/fallback after the now-proven UEFI full-ISO RAM boot.
-2. Inject interruptions through that disposable-guest path and prove the complete recovery matrix.
-3. Add Secure Boot coverage and replace the isolated guest HTTP handoff with a pinned TLS-capable recovery transport.
+1. Join the now-proven real UEFI BootNext/fallback/power-loss matrix to the full-installer-in-RAM path in one disposable run.
+2. Add Secure Boot coverage and replace the isolated guest HTTP handoff with a pinned TLS-capable recovery transport.
+3. Build disposable matrices for Windows BCD bootsequence, systemd-boot one-shot, and GRUB next_entry.
 4. Extend read-only inspection with ESP, boot-manager, and network-boot hints.
 5. Add signature-chain verification in addition to pinned SHA-256.
 6. Wire the guided TUI workflow and live evidence into the React/Tauri command bridge.
+
+On Windows, prepare the disposable VM runtime with `cargo run -p nousb -- vm qemu bootstrap-runtime "ASSEMBLE PROJECT-LOCAL QEMU RUNTIME"`. Keep `.nousb/` out of cloud-synced folders, and run VM rehearsals one at a time.
 
 ## Fresh Chat Prompt
 
 Paste this into a new chat:
 
 ```text
-We are continuing the NoUSB OS Switcher project in /home/jebarson/Documents/RevX.
+We are continuing the NoUSB OS Switcher project in this repository (RevX).
 Read START_HERE.md, TODO.md, docs/HANDOFF.md, AGENTS.md, README.md, and docs/MASTER_PROMPT.md first.
 Keep default builds non-destructive.
 Run cargo test --workspace before finalizing changes.

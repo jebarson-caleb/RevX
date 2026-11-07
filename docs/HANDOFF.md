@@ -10,7 +10,11 @@ NoUSB OS Switcher is currently a safe planning and verified-staging scaffold. It
 
 `vm rehearse` now exercises one complete one-shot boot cycle and interruption after every transition for UEFI BootNext, Windows BCD bootsequence, systemd-boot one-shot, and GRUB next-entry models. The original default/order, selector cleanup, temporary asset cleanup, and fallback invariants pass. This is a state-machine proof, not a real VM boot; see `docs/VM_ONE_SHOT.md`.
 
-The current Windows host also has a project-local QEMU 10.1.5/OVMF runtime assembled from Alpine v3.23 signed packages through the existing `docker-desktop` WSL2 distribution. Typed disposable runs now cover firmware-only startup, direct netboot kernel/initrd execution, a full Ubuntu Server ISO copied into initramfs, and the combined UEFI-to-full-RAM path. In the combined run, OVMF launched the pinned official EFI assets, Linux reported EDK II UEFI, casper downloaded and mounted the verified 3.2 GiB Ubuntu 24.04.4 Server ISO in RAM, QMP removed the temporary FAT boot device and backing node, the source server stopped, and fresh Ubuntu/Subiquity/TTY evidence appeared afterward. The final QMP block list contained only the two OVMF pflash devices. Neither the run nor its code touched host boot state or a physical disk. Secure Boot, guest-side HTTPS, a disposable current-OS fallback boot, and the power-loss matrix remain unproven gates.
+The current Windows host also has a project-local QEMU 10.1.5/OVMF runtime assembled from Alpine v3.23 signed packages through the existing `docker-desktop` WSL2 distribution. Typed disposable runs now cover firmware-only startup, direct netboot kernel/initrd execution, a full Ubuntu Server ISO copied into initramfs, and the combined UEFI-to-full-RAM path. In the combined run, OVMF launched the pinned official EFI assets, Linux reported EDK II UEFI, casper downloaded and mounted the verified 3.2 GiB Ubuntu 24.04.4 Server ISO in RAM, QMP removed the temporary FAT boot device and backing node, the source server stopped, and fresh Ubuntu/Subiquity/TTY evidence appeared afterward. The final QMP block list contained only the two OVMF pflash devices. Neither the run nor its code touched host boot state or a physical disk.
+
+The runtime is now reproducible from the repo with `vm qemu bootstrap-runtime "ASSEMBLE PROJECT-LOCAL QEMU RUNTIME"`. A `.nousb/` from another machine is not needed, but the Ubuntu Server ISO must be downloaded and staged again (`image download ubuntu-24.04-server`, then `staging create`).
+
+`vm qemu rehearse-current-os-one-shot "RUN DISPOSABLE CURRENT OS UEFI ONE-SHOT MATRIX" [scenario]` provides real-firmware evidence for UEFI one-shot selection. A disposable current OS uses `efibootmgr` to create a temporary entry outside `BootOrder` and arm `BootNext`. OVMF starts the pinned official shim/GRUB/kernel chain exactly once, and the installer deliberately panics and reboots. Firmware then returns to the unchanged default, and the current OS deletes the entry and verifies the original state. Power is cut after each of five transaction steps. Secure Boot, guest-side HTTPS, the one-shot matrix joined to the full installer in RAM, and the BCD/systemd-boot/GRUB backends remain unproven gates. Run VM rehearsals one at a time, and keep `.nousb/` out of OneDrive.
 
 Operation plans now include typed `BootPlan` data. The default plan keeps the current OS as the default boot target and disallows permanent boot-order changes.
 
@@ -44,6 +48,10 @@ Portable preview data lives at `apps/desktop/preview-data.json`; live data can b
 Ubuntu 24.04.4 and Fedora 44 now have direct official artifact manifests with exact size and SHA-256. `image manifest`, `image probe`, `image download`, and `image verify-profile` expose the acquisition workflow. Windows 11 remains fail-closed because its consumer ISO link is generated per session.
 
 `staging inspect` verifies an ISO and previews its declared kernel/initrd/EFI assets. `staging create` extracts only those paths, hashes each output, writes `bundle.json`, and leaves `execution_enabled=false`. No boot adapter consumes the bundle.
+
+## Host One-Shot Boot (physical testing)
+
+`nousb boot plan <profile>` works in every build and prints the exact files, firmware entry, generated GRUB configuration, and every blocker. `nousb boot arm <profile> "BOOT ONCE INTO <profile>"` and `nousb boot cleanup "CLEAN UP NOUSB BOOT"` exist only in `real-windows-boot` / `real-linux-boot` builds. The transaction lives in `crates/nousb-core/src/host_boot.rs`; the platform backends are `crates/nousb-platform-windows/src/host_boot.rs` (`bcdedit` bootsequence) and `crates/nousb-platform-linux/src/host_boot.rs` (`efibootmgr` BootNext). State is persisted to `.nousb/host-boot/state.json` after every step. Physical results are still pending; see `docs/PHYSICAL_TESTING.md`.
 
 ## First Commands To Run
 
@@ -83,4 +91,4 @@ cargo run -p nousb -- --json plan boot-once ubuntu-24.04-desktop
 
 ## Recommended Next Task
 
-Add a disposable current-OS guest disk and prove one-shot selection, fallback to that OS, cleanup, and interruption/power-loss recovery around the already-proven combined UEFI full-RAM handoff. Then add Secure Boot validation and guest-side HTTPS or another authenticated transport. Do not implement host boot changes until that recovery matrix passes.
+Join the passing one-shot matrix to the combined UEFI full-RAM handoff in one disposable run: the `BootNext` installer entry boots casper with the full verified ISO, and a later reboot proves fallback. Then add Secure Boot validation and guest-side HTTPS or another authenticated transport. After that, build the BCD, systemd-boot, and GRUB one-shot matrices. Do not implement host boot changes until those pass.

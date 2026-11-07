@@ -11,10 +11,40 @@ use reqwest::redirect::Policy;
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 
+mod boot_hints;
+mod host_boot;
+mod journal;
+mod provenance;
 mod qemu;
+mod recovery;
+pub use boot_hints::{
+    parse_efi_boot_order, parse_efi_load_option, BootEnvironmentHints, EfiBootTarget,
+    EfiLoadOption, EFI_GLOBAL_VARIABLE_GUID,
+};
+pub use host_boot::{
+    arm_confirmation_phrase, arm_host_one_shot, cleanup_host_one_shot, derive_live_boot_recipe,
+    host_boot_dir, host_boot_state_path, load_host_boot_state, plan_host_one_shot,
+    render_grub_config, CommandOutput, CommandRunner, EspMount, FakeHostBootBackend,
+    HostBootBackend, HostBootFacts, HostBootPhase, HostBootPlan, HostBootState, LiveBootFamily,
+    LiveBootRecipe, PlannedFile, ScriptedCommandRunner, SystemCommandRunner,
+    CLEANUP_CONFIRMATION_PHRASE, HOST_BOOT_ENTRY_LABEL, HOST_BOOT_ESP_DIR, HOST_BOOT_STAGING_DIR,
+};
+pub use journal::{
+    journal_database_path, journal_execution_report, migrate_saved_reports, open_journal,
+    record_execution_report, write_journal_entry, JournalMigration,
+};
+pub use provenance::{
+    checksum_document_lists, fetch_https_bytes, pinned_signing_key, verify_cleartext_signature,
+    verify_detached_signature, verify_profile_signature, ChecksumSignatureFormat, PinnedSigningKey,
+    SignatureVerification, PINNED_SIGNING_KEYS,
+};
 pub use qemu::{
     acquire_qemu_windows_runtime, qemu_runtime_cache_path, qemu_windows_runtime_manifest,
     QemuRuntimeDownload, QemuRuntimeManifest,
+};
+pub use recovery::{
+    assess_recovery, load_execution_report, parse_execution_report, resume_simulated_report,
+    RecoveryAction, RecoveryAssessment,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +101,7 @@ pub struct SystemInventory {
     pub encryption: EncryptionState,
     pub disk_inventory: DiskInventory,
     pub boot_entries: Vec<BootEntry>,
+    pub boot_hints: BootEnvironmentHints,
     pub warnings: Vec<String>,
 }
 
@@ -233,6 +264,8 @@ pub struct InstallerProfile {
     pub artifact_filename: Option<String>,
     pub artifact_size_bytes: Option<u64>,
     pub signature_url: Option<String>,
+    /// Id of the pinned vendor key that signs the checksum document (see `provenance`).
+    pub signing_key: Option<String>,
     pub homepage: String,
     pub license_notes: String,
     pub supported_platforms: Vec<String>,
@@ -767,7 +800,7 @@ impl OperationPlan {
 
     pub fn to_json(&self) -> String {
         let mut output = String::new();
-        output.push_str("{");
+        output.push('{');
         output.push_str(&json_pair("id", &self.id));
         output.push_str(&format!(",\"kind\":\"{}\"", self.kind));
         match &self.profile_id {
@@ -877,7 +910,7 @@ impl InstallerProfile {
             .map(|strategy| strategy.as_str().to_string())
             .collect();
         format!(
-            "{{{},{},{},{},{},{},{},{},{},\"artifact_filename\":{},\"artifact_size_bytes\":{},\"signature_url\":{}, {},{},\"supported_platforms\":{},\"supported_staging_strategies\":{},\"required_free_space_gb\":{},\"extraction_rules\":{},\"kernel_initrd_paths\":{},\"bootloader_paths\":{}, {},\"known_limitations\":{}, {}}}",
+            "{{{},{},{},{},{},{},{},{},{},\"artifact_filename\":{},\"artifact_size_bytes\":{},\"signature_url\":{},\"signing_key\":{}, {},{},\"supported_platforms\":{},\"supported_staging_strategies\":{},\"required_free_space_gb\":{},\"extraction_rules\":{},\"kernel_initrd_paths\":{},\"bootloader_paths\":{}, {},\"known_limitations\":{}, {}}}",
             json_pair("schema_version", &self.schema_version),
             json_pair("id", &self.id),
             json_pair("name", &self.name),
@@ -892,6 +925,7 @@ impl InstallerProfile {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".into()),
             json_optional_value(self.signature_url.as_deref()),
+            json_optional_value(self.signing_key.as_deref()),
             json_pair("homepage", &self.homepage),
             json_pair("license_notes", &self.license_notes),
             json_string_array(&self.supported_platforms),
@@ -966,7 +1000,7 @@ impl SystemInventory {
             })
             .collect();
         format!(
-            "{{{},{},{},\"memory_total_mb\":{},{},{},{},\"disk_inventory\":{{\"disks\":{},\"available_space_gb\":{},\"partitions\":[{}]}},\"boot_entries\":[{}],\"warnings\":{}}}",
+            "{{{},{},{},\"memory_total_mb\":{},{},{},{},\"disk_inventory\":{{\"disks\":{},\"available_space_gb\":{},\"partitions\":[{}]}},\"boot_entries\":[{}],\"boot_hints\":{},\"warnings\":{}}}",
             json_pair("adapter", adapter),
             json_pair("os_name", &self.os_name),
             json_pair("arch", &self.arch),
@@ -983,6 +1017,7 @@ impl SystemInventory {
                 .unwrap_or_else(|| "null".into()),
             partitions.join(","),
             boot_entries.join(","),
+            self.boot_hints.to_json(),
             json_string_array(&self.warnings)
         )
     }
@@ -1271,6 +1306,7 @@ pub fn save_execution_report(
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", safe_filename(&report.plan_id)));
     fs::write(&path, report.to_json())?;
+    record_execution_report(&mut open_journal(base_dir)?, report)?;
     write_journal_entry(
         base_dir,
         &format!(
@@ -1502,6 +1538,19 @@ impl FakePlatformAdapter {
                     label: "Windows Boot Manager".into(),
                     is_default: true,
                 }],
+                boot_hints: BootEnvironmentHints {
+                    esp_present: Some(true),
+                    esp_location: Some("disk 0 partition 1".into()),
+                    esp_size_bytes: Some(272 * 1024 * 1024),
+                    recovery_partition_present: Some(true),
+                    boot_managers: vec!["Windows Boot Manager".into()],
+                    firmware_boot_current: Some("Boot0000".into()),
+                    firmware_boot_order: Some(vec!["Boot0000".into(), "Boot0001".into()]),
+                    firmware_boot_next: None,
+                    network_boot_entries: Some(1),
+                    http_boot_entries: Some(0),
+                    unknowns: vec![],
+                },
                 warnings: vec![
                     "BitLocker recovery key backup must be confirmed before boot changes.".into(),
                 ],
@@ -1550,6 +1599,16 @@ impl FakePlatformAdapter {
                     label: "GRUB".into(),
                     is_default: true,
                 }],
+                boot_hints: BootEnvironmentHints {
+                    esp_present: Some(true),
+                    esp_location: Some("/boot/efi".into()),
+                    boot_managers: vec!["grub".into(), "shim".into()],
+                    firmware_boot_current: Some("Boot0001".into()),
+                    firmware_boot_order: Some(vec!["Boot0001".into()]),
+                    network_boot_entries: Some(0),
+                    http_boot_entries: Some(0),
+                    ..Default::default()
+                },
                 warnings: vec![
                     "LUKS header backup should be completed manually before boot work.".into(),
                     "Btrfs snapshot may be available before risky operations.".into(),
@@ -1591,6 +1650,7 @@ impl FakePlatformAdapter {
                     label: "macOS".into(),
                     is_default: true,
                 }],
+                boot_hints: BootEnvironmentHints::default(),
                 warnings: vec![
                     "Apple Silicon boot policy must not be bypassed.".into(),
                     "Use only Apple-supported installer mechanisms.".into(),
@@ -1687,6 +1747,7 @@ pub fn built_in_profiles() -> Vec<InstallerProfile> {
             artifact_filename: None,
             artifact_size_bytes: None,
             signature_url: None,
+            signing_key: None,
             homepage: "about:blank".into(),
             license_notes: "Catalog parsing failed.".into(),
             supported_platforms: vec![],
@@ -1739,6 +1800,7 @@ pub fn parse_installer_profile(source: &str) -> Result<InstallerProfile, NoUsbEr
         artifact_filename: fields.optional("artifact_filename"),
         artifact_size_bytes,
         signature_url: fields.optional("signature_url"),
+        signing_key: fields.optional("signing_key"),
         homepage: fields.required("homepage")?,
         license_notes: fields.required("license_notes")?,
         supported_platforms: fields.array("supported_platforms")?,
@@ -1762,6 +1824,9 @@ pub fn parse_installer_profile(source: &str) -> Result<InstallerProfile, NoUsbEr
 }
 
 pub fn validate_profile(profile: &InstallerProfile) -> Result<(), NoUsbError> {
+    if let Some(key) = profile.signing_key.as_deref() {
+        pinned_signing_key(key)?;
+    }
     if profile.schema_version != "1" {
         return Err(NoUsbError::ProfileParse(format!(
             "{} uses unsupported schema_version {}",
@@ -2532,6 +2597,49 @@ fn open_iso(path: &Path) -> Result<ISO9660, NoUsbError> {
     })
 }
 
+/// Reads a small text file from an ISO; `Ok(None)` when the ISO has no such file.
+pub(crate) fn read_iso_text_file(
+    iso_path: &Path,
+    value: &str,
+    max_bytes: u64,
+) -> Result<Option<String>, NoUsbError> {
+    let mut iso = open_iso(iso_path)?;
+    let Some(entry) = find_iso_entry(&mut iso, value) else {
+        return Ok(None);
+    };
+    if !entry.is_file() || u64::from(entry.file_size()) > max_bytes {
+        return Err(NoUsbError::Verification(format!(
+            "{value} in {} is not a small regular file",
+            iso_path.display()
+        )));
+    }
+    let mut buffer = vec![0_u8; entry.file_size() as usize];
+    let read = iso
+        .read_file(&entry, 0, &mut buffer)
+        .ok_or_else(|| NoUsbError::Verification(format!("could not read {value} from the ISO")))?;
+    buffer.truncate(read);
+    Ok(Some(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
+/// Extracts one ISO file to a new path; `Ok(false)` when the ISO has no such file.
+pub(crate) fn extract_iso_file(
+    iso_path: &Path,
+    value: &str,
+    output_path: &Path,
+) -> Result<bool, NoUsbError> {
+    let mut iso = open_iso(iso_path)?;
+    match find_iso_entry(&mut iso, value) {
+        Some(entry) if entry.is_file() => {
+            extract_iso_entry(&mut iso, &entry, output_path)?;
+            Ok(true)
+        }
+        Some(_) => Err(NoUsbError::Verification(format!(
+            "{value} in the ISO is not a file"
+        ))),
+        None => Ok(false),
+    }
+}
+
 fn safe_iso_relative_path(value: &str) -> Result<PathBuf, NoUsbError> {
     if value.contains('\\') || value.contains(':') {
         return Err(NoUsbError::Verification(format!("unsafe ISO path {value}")));
@@ -2647,7 +2755,7 @@ pub fn plan_operation(
         Some(id) => Some(find_profile(id)?),
         None => None,
     };
-    let id = format!("plan-{}-{}", kind, now_stamp());
+    let id = format!("plan-{}-{}", kind, unique_plan_stamp());
     let mut steps = vec![
         OperationStep {
             id: "inspect-system".into(),
@@ -3040,35 +3148,6 @@ pub fn assess_delivery(
     })
 }
 
-pub fn write_journal_entry(base_dir: &Path, entry: &str) -> Result<PathBuf, NoUsbError> {
-    let dir = base_dir.join(".nousb").join("journal");
-    fs::create_dir_all(&dir)?;
-    let sqlite_path = dir.join("operation_journal.sqlite3");
-    let escaped_entry = entry.replace('\'', "''");
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS operations (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, message TEXT NOT NULL);
-         INSERT INTO operations (created_at, message) VALUES ({}, '{}');",
-        now_stamp(),
-        escaped_entry
-    );
-    let sqlite_result = std::process::Command::new("sqlite3")
-        .arg(&sqlite_path)
-        .arg(sql)
-        .output();
-
-    let log_path = dir.join("operations.log");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    writeln!(file, "{} {entry}", now_stamp())?;
-    match sqlite_result {
-        Ok(output) if output.status.success() => Ok(sqlite_path),
-        Ok(_) => Ok(log_path),
-        Err(_) => Ok(log_path),
-    }
-}
-
 pub fn create_recovery_pack(
     base_dir: &Path,
     inventory: &SystemInventory,
@@ -3131,11 +3210,8 @@ impl PlatformAdapter for HostPlatform {
         } else {
             SecureBootState::Unsupported
         };
-        let encryption = if Path::new("/etc/crypttab").exists() {
-            EncryptionState::Unknown
-        } else {
-            EncryptionState::Unknown
-        };
+        // Generic inspection cannot tell; platform adapters refine this read-only.
+        let encryption = EncryptionState::Unknown;
         let mut warnings =
             vec!["Default build performs inspection only and will not edit boot settings.".into()];
         if os_name == "macos" {
@@ -3154,6 +3230,12 @@ impl PlatformAdapter for HostPlatform {
                 available_space_gb: None,
             },
             boot_entries: vec![],
+            boot_hints: BootEnvironmentHints {
+                unknowns: vec![
+                    "ESP, boot managers, and firmware boot entries need a platform adapter".into(),
+                ],
+                ..Default::default()
+            },
             warnings,
         })
     }
@@ -3175,6 +3257,15 @@ fn now_stamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .unwrap_or(0)
+}
+
+/// Seconds plus nanoseconds, so plans created within the same second never share an id
+/// (a shared id would make one saved report overwrite another).
+fn unique_plan_stamp() -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}-{:09}", elapsed.as_secs(), elapsed.subsec_nanos())
 }
 
 #[derive(Debug)]
@@ -3413,22 +3504,11 @@ fn safe_filename(value: &str) -> String {
         .collect()
 }
 
-fn escape_json(value: &str) -> String {
-    let mut escaped = String::new();
-    for character in value.chars() {
-        match character {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            character if character.is_control() => {
-                escaped.push_str(&format!("\\u{:04x}", character as u32));
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped
+/// Escapes `value` for the inside of a JSON string literal. serde_json does the escaping, so
+/// every crate's hand-assembled JSON stays valid for quotes, backslashes, and control characters.
+pub fn escape_json(value: &str) -> String {
+    let quoted = serde_json::Value::String(value.to_owned()).to_string();
+    quoted[1..quoted.len() - 1].to_owned()
 }
 
 #[cfg(test)]
@@ -4094,7 +4174,7 @@ post_boot_instructions = "None"
     }
 
     fn iso_directory_record(lba: u32, size: u32, is_directory: bool, name: &[u8]) -> Vec<u8> {
-        let padding = usize::from(name.len() % 2 == 0);
+        let padding = usize::from(name.len().is_multiple_of(2));
         let length = 33 + name.len() + padding;
         let mut record = vec![0_u8; length];
         record[0] = length as u8;

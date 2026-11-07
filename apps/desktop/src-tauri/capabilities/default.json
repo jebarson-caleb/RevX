@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window may call NoUSB's read-only and simulation commands; no plugin permissions are granted.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

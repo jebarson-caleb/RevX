@@ -3,9 +3,20 @@ name = "nousb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Safe-first CLI and guided TUI for planning, verifying, and staging official OS installers without a USB stick"
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 nousb-core = { path = "../nousb-core" }
 nousb-platform-linux = { path = "../nousb-platform-linux" }
 nousb-platform-windows = { path = "../nousb-platform-windows" }
+
+# Default builds stay non-destructive. These opt-in features compile the real one-shot boot
+# backends used for physical testing; see docs/PHYSICAL_TESTING.md.
+[features]
+default = []
+real-windows-boot = ["nousb-core/real-windows-boot", "nousb-platform-windows/real-windows-boot"]
+real-linux-boot = ["nousb-core/real-linux-boot", "nousb-platform-linux/real-linux-boot"]
 

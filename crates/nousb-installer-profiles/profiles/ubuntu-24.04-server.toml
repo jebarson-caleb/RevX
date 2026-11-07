@@ -10,6 +10,7 @@ sha256 = "e907d92eeec9df64163a7e454cbc8d7755e8ddc7ed42f99dbc80c40f1a138433"
 artifact_filename = "ubuntu-24.04.4-live-server-amd64.iso"
 artifact_size_bytes = "3405469696"
 signature_url = "https://releases.ubuntu.com/24.04/SHA256SUMS.gpg"
+signing_key = "ubuntu-cdimage-2012"
 homepage = "https://ubuntu.com/server"
 license_notes = "Use Canonical's official download and license terms."
 supported_platforms = ["windows_uefi", "linux_uefi"]

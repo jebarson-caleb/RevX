@@ -14,4 +14,17 @@ edition = "2021"
 license = "Apache-2.0 OR MIT"
 version = "0.1.0"
 authors = ["NoUSB OS Switcher contributors"]
+repository = "https://github.com/jebarson-caleb/RevX"
+# `usize::is_multiple_of` and other recent std APIs are used.
+rust-version = "1.87"
+publish = false
 
+# Multi-gigabyte ISO verification is unusably slow with unoptimized hashing in dev builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3

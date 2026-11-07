@@ -1,0 +1,3 @@
+# Vendor-signed documents must stay byte-exact for signature verification.
+crates/nousb-core/tests/fixtures/** -text
+crates/nousb-installer-profiles/keys/** -text

@@ -3,10 +3,18 @@ name = "nousb-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Typed planning, verification, staging, journaling, and recovery model for NoUSB OS Switcher"
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 iso9660_simple = "0.2.3"
+pgp = "0.21.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 sha2 = "0.10.9"
 
 [features]

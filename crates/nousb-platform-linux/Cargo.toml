@@ -3,6 +3,10 @@ name = "nousb-platform-linux"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Read-only Linux inspection adapter for NoUSB OS Switcher"
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 nousb-core = { path = "../nousb-core" }
