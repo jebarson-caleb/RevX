@@ -205,6 +205,8 @@ pub struct HostBootFacts {
     /// `Some(true)` blocks: GRUB and the live initramfs cannot read BitLocker or LUKS volumes.
     pub staging_volume_encrypted: Option<bool>,
     pub staging_free_bytes: Option<u64>,
+    /// Host tools the real backend needs but could not run (for example `efibootmgr`).
+    pub missing_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,9 +436,11 @@ pub fn plan_host_one_shot(
         "Re-verify the full ISO against the pinned size and SHA-256".into(),
         "Back up firmware boot entries (and the BCD store on Windows) to .nousb/host-boot/<plan>/backup".into(),
         format!(
-            "Copy the ISO to {}{} and verify the copy's SHA-256",
-            facts.staging_volume_root.display(),
-            staging_relative_dir
+            "Copy the ISO to {} and verify the copy's SHA-256",
+            facts
+                .staging_volume_root
+                .join(relative_native(&staging_relative_dir))
+                .display()
         ),
         format!("Mount the ESP (Windows: a free drive letter via mountvol) and create EFI/{HOST_BOOT_ESP_DIR}; refuse if it exists"),
         "Copy the ISO's signed shim/GRUB/MokManager to the ESP and write the generated grub.cfg".into(),
@@ -511,6 +515,11 @@ fn host_preflight(
         blockers.push(
             "not elevated: arming needs Administrator (Windows) or root (Linux); planning works without it".into(),
         );
+    }
+    for tool in &facts.missing_tools {
+        blockers.push(format!(
+            "required tool {tool} is not installed; install it with your package manager (for example `apt install {tool}` or `dnf install {tool}`)"
+        ));
     }
     match facts.staging_volume_encrypted {
         Some(true) => blockers.push(format!(
@@ -1580,7 +1589,46 @@ mod tests {
             staging_filesystem: Some("ext4".into()),
             staging_volume_encrypted: Some(false),
             staging_free_bytes: Some(u64::MAX / 2),
+            missing_tools: vec![],
         }
+    }
+
+    #[test]
+    fn copy_step_joins_staging_root_without_trailing_separator() {
+        let dir = std::env::temp_dir().join(format!("nousb-hb-step-{}", std::process::id()));
+        let mut host = facts(&dir);
+        host.staging_volume_root = PathBuf::from("/boot");
+        let plan = plan_host_one_shot(
+            "ubuntu-24.04-desktop",
+            &dir.join("missing.iso"),
+            &host,
+            "fake",
+            true,
+        )
+        .unwrap();
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| step.starts_with("Copy the ISO to"))
+            .unwrap();
+        assert!(
+            step.starts_with(&format!(
+                "Copy the ISO to {}",
+                PathBuf::from("/boot").join("NoUSB").display()
+            )),
+            "{step}"
+        );
+    }
+
+    #[test]
+    fn missing_efibootmgr_blocks_the_plan() {
+        let dir = std::env::temp_dir().join(format!("nousb-hb-tools-{}", std::process::id()));
+        let mut host = facts(&dir);
+        host.missing_tools = vec!["efibootmgr".into()];
+        let (blockers, _) = host_preflight(&host, LiveBootFamily::Casper, 1024, true);
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker.contains("required tool efibootmgr is not installed")));
     }
 
     #[test]
