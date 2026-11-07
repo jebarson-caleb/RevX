@@ -191,7 +191,7 @@ mod backend {
 
     pub struct WindowsHostBootBackend<R: CommandRunner> {
         pub runner: R,
-        mounted_letter: Option<char>,
+        pub(crate) mounted_letter: Option<char>,
     }
 
     impl<R: CommandRunner> WindowsHostBootBackend<R> {
@@ -212,6 +212,19 @@ mod backend {
                 .rev()
                 .find(|letter| !Path::new(&format!("{letter}:\\")).exists())
                 .ok_or_else(|| NoUsbError::Io("no free drive letter to mount the ESP".into()))
+        }
+    }
+
+    fn parse_drive_letter(path: &Path) -> Option<char> {
+        let text = path.to_string_lossy();
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        let mut chars = text.chars();
+        let first = chars.next()?;
+        let second = chars.next()?;
+        if first.is_ascii_alphabetic() && second == ':' {
+            Some(first.to_ascii_uppercase())
+        } else {
+            None
         }
     }
 
@@ -273,7 +286,11 @@ mod backend {
             if !mount.mounted_by_us {
                 return Ok(());
             }
-            if let Some(letter) = self.mounted_letter.take() {
+            let letter = parse_drive_letter(&mount.path).or(self.mounted_letter);
+            if let Some(letter) = letter {
+                if self.mounted_letter.map(|c| c.to_ascii_uppercase()) == Some(letter) {
+                    self.mounted_letter = None;
+                }
                 let target = format!("{letter}:");
                 self.runner.run_checked("mountvol", &[&target, "/D"])?;
             }
@@ -321,16 +338,63 @@ mod backend {
                 .boot_order()
                 .map(|order| order.contains(&guid))
                 .unwrap_or(false);
-            if in_order {
-                // Keep UEFI BootOrder exactly as it was.
+            let removed = if in_order {
                 self.runner.run_checked(
                     "bcdedit",
                     &["/set", FWBOOTMGR, "displayorder", &guid, "/remove"],
-                )?;
-            }
-            if let Err(error) = configured {
-                let _ = self.runner.run("bcdedit", &["/delete", &guid]);
-                return Err(error);
+                )
+            } else {
+                Ok(String::new())
+            };
+            if configured.is_err() || removed.is_err() {
+                let deleted = self.runner.run("bcdedit", &["/delete", &guid]);
+                let mut errors = Vec::new();
+                if let Err(err) = configured {
+                    let msg = match err {
+                        NoUsbError::Io(text) => text,
+                        other => other.to_string(),
+                    };
+                    errors.push(msg);
+                }
+                if let Err(err) = removed {
+                    let msg = match err {
+                        NoUsbError::Io(text) => text,
+                        other => other.to_string(),
+                    };
+                    errors.push(msg);
+                }
+                match deleted {
+                    Ok(output) if !output.success => {
+                        let stderr = output.stderr.trim();
+                        let stdout = output.stdout.trim();
+                        let details = match (stderr.is_empty(), stdout.is_empty()) {
+                            (false, false) => format!("{stderr} {stdout}"),
+                            (false, true) => stderr.to_string(),
+                            (true, false) => stdout.to_string(),
+                            (true, true) => String::new(),
+                        };
+                        if details.is_empty() {
+                            errors.push(format!(
+                                "warning: orphaned entry {guid} could not be deleted"
+                            ));
+                        } else {
+                            errors.push(format!(
+                                "warning: orphaned entry {guid} could not be deleted: {details}"
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        let msg = match err {
+                            NoUsbError::Io(text) => text,
+                            other => other.to_string(),
+                        };
+                        errors.push(format!(
+                            "warning: orphaned entry {guid} could not be deleted: {msg}"
+                        ));
+                    }
+                    _ => {}
+                }
+                return Err(NoUsbError::Io(errors.join("; ")));
             }
             Ok(guid)
         }
@@ -373,7 +437,7 @@ mod backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nousb_core::{EspMount, HostBootBackend, ScriptedCommandRunner};
+    use nousb_core::{CommandOutput, EspMount, HostBootBackend, ScriptedCommandRunner};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -514,5 +578,186 @@ mod tests {
             .unwrap();
         assert!(backend.runner.calls.iter().any(|call| call
             == "bcdedit /set {fwbootmgr} displayorder {abcdef01-2345-6789-abcd-ef0123456789} /remove"));
+    }
+
+    #[test]
+    fn display_order_removal_failure_deletes_copied_entry() {
+        let runner = ScriptedCommandRunner::new(|line| {
+            if line.starts_with("bcdedit /copy") {
+                ScriptedCommandRunner::ok("copied to {abcdef01-2345-6789-abcd-ef0123456789}.")
+            } else if line == "bcdedit /enum {fwbootmgr} /v" {
+                ScriptedCommandRunner::ok(&FWBOOTMGR_ENUM.replace(
+                    "timeout",
+                    "                        {abcdef01-2345-6789-abcd-ef0123456789}\ntimeout",
+                ))
+            } else if line.contains("displayorder") && line.contains("/remove") {
+                CommandOutput {
+                    stdout: String::new(),
+                    stderr: "access denied".into(),
+                    success: false,
+                }
+            } else {
+                ScriptedCommandRunner::ok("ok")
+            }
+        });
+        let mut backend = WindowsHostBootBackend::new(runner);
+        let mount = EspMount {
+            path: PathBuf::from("Z:\\"),
+            mounted_by_us: true,
+        };
+        let err = backend
+            .create_entry("NoUSB", "\\EFI\\NoUSB\\BOOTX64.EFI", &mount)
+            .unwrap_err();
+        assert!(err.to_string().contains("access denied"));
+        assert!(backend
+            .runner
+            .calls
+            .iter()
+            .any(|call| call == "bcdedit /delete {abcdef01-2345-6789-abcd-ef0123456789}"));
+    }
+
+    #[test]
+    fn unmount_esp_unmounts_mount_path_when_mounted_letter_is_none() {
+        let runner = ScriptedCommandRunner::new(|_| ScriptedCommandRunner::ok("ok"));
+        let mut backend = WindowsHostBootBackend::new(runner);
+        assert!(backend.mounted_letter.is_none());
+        let mount = EspMount {
+            path: PathBuf::from("Y:\\"),
+            mounted_by_us: true,
+        };
+        backend.unmount_esp(&mount).unwrap();
+        assert_eq!(backend.runner.calls, vec!["mountvol Y: /D"]);
+        assert!(backend.mounted_letter.is_none());
+    }
+
+    #[test]
+    fn unmount_esp_clears_matching_mounted_letter() {
+        let runner = ScriptedCommandRunner::new(|_| ScriptedCommandRunner::ok("ok"));
+        let mut backend = WindowsHostBootBackend::new(runner);
+        backend.mounted_letter = Some('Y');
+        let mount = EspMount {
+            path: PathBuf::from("Y:\\"),
+            mounted_by_us: true,
+        };
+        backend.unmount_esp(&mount).unwrap();
+        assert_eq!(backend.runner.calls, vec!["mountvol Y: /D"]);
+        assert!(backend.mounted_letter.is_none());
+    }
+
+    #[test]
+    fn create_entry_when_both_set_path_and_remove_fail_reports_both_and_attempts_delete() {
+        let runner = ScriptedCommandRunner::new(|line| {
+            if line.starts_with("bcdedit /copy") {
+                ScriptedCommandRunner::ok(
+                    "The entry was successfully copied to {abcdef01-2345-6789-abcd-ef0123456789}.",
+                )
+            } else if line.contains("path") {
+                CommandOutput {
+                    stdout: String::new(),
+                    stderr: "set path failed".into(),
+                    success: false,
+                }
+            } else if line == "bcdedit /enum {fwbootmgr} /v" {
+                ScriptedCommandRunner::ok(&FWBOOTMGR_ENUM.replace(
+                    "timeout",
+                    "                        {abcdef01-2345-6789-abcd-ef0123456789}\ntimeout",
+                ))
+            } else if line.contains("displayorder") && line.contains("/remove") {
+                CommandOutput {
+                    stdout: String::new(),
+                    stderr: "remove displayorder failed".into(),
+                    success: false,
+                }
+            } else if line.starts_with("bcdedit /delete") {
+                ScriptedCommandRunner::ok("deleted")
+            } else {
+                ScriptedCommandRunner::ok("ok")
+            }
+        });
+        let mut backend = WindowsHostBootBackend::new(runner);
+        let mount = EspMount {
+            path: PathBuf::from("Z:\\"),
+            mounted_by_us: true,
+        };
+        let err = backend
+            .create_entry("NoUSB", "\\EFI\\NoUSB\\BOOTX64.EFI", &mount)
+            .unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("set path failed"),
+            "error should report set path failure: {err_text}"
+        );
+        assert!(
+            err_text.contains("remove displayorder failed"),
+            "error should report remove displayorder failure: {err_text}"
+        );
+        assert!(
+            backend
+                .runner
+                .calls
+                .iter()
+                .any(|call| call == "bcdedit /delete {abcdef01-2345-6789-abcd-ef0123456789}"),
+            "delete must be attempted for the created entry"
+        );
+    }
+
+    #[test]
+    fn create_entry_when_delete_fails_after_error_reports_orphaned_entry() {
+        let runner = ScriptedCommandRunner::new(|line| {
+            if line.starts_with("bcdedit /copy") {
+                ScriptedCommandRunner::ok(
+                    "The entry was successfully copied to {abcdef01-2345-6789-abcd-ef0123456789}.",
+                )
+            } else if line.contains("path") {
+                CommandOutput {
+                    stdout: String::new(),
+                    stderr: "set path failed".into(),
+                    success: false,
+                }
+            } else if line == "bcdedit /enum {fwbootmgr} /v" {
+                ScriptedCommandRunner::ok(FWBOOTMGR_ENUM)
+            } else if line.starts_with("bcdedit /delete") {
+                CommandOutput {
+                    stdout: "access denied to bcd store".into(),
+                    stderr: "fatal error".into(),
+                    success: false,
+                }
+            } else {
+                ScriptedCommandRunner::ok("ok")
+            }
+        });
+        let mut backend = WindowsHostBootBackend::new(runner);
+        let mount = EspMount {
+            path: PathBuf::from("Z:\\"),
+            mounted_by_us: true,
+        };
+        let err = backend
+            .create_entry("NoUSB", "\\EFI\\NoUSB\\BOOTX64.EFI", &mount)
+            .unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("set path failed"),
+            "error should report initial cause: {err_text}"
+        );
+        assert!(
+            err_text.contains("could not be deleted"),
+            "error should warn that entry could not be deleted: {err_text}"
+        );
+        assert!(
+            err_text.contains("{abcdef01-2345-6789-abcd-ef0123456789}"),
+            "error should include the orphaned entry guid: {err_text}"
+        );
+        assert!(
+            err_text.contains("fatal error") || err_text.contains("access denied to bcd store"),
+            "error should include delete stderr/stdout: {err_text}"
+        );
+        assert!(
+            backend
+                .runner
+                .calls
+                .iter()
+                .any(|call| call == "bcdedit /delete {abcdef01-2345-6789-abcd-ef0123456789}"),
+            "delete must have been attempted"
+        );
     }
 }

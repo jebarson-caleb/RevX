@@ -1038,6 +1038,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        [cmd, sub, profile] if cmd == "boot" && sub == "arm" => {
+            let plan = host_boot_plan(&cwd, profile, &options)?;
+            return Err(format!(
+                "boot arm requires typed confirmation: nousb boot arm {profile} \"{}\"",
+                plan.confirmation_phrase
+            )
+            .into());
+        }
         [cmd, sub] if cmd == "boot" && sub == "status" => {
             let state = load_host_boot_state(&cwd)?;
             match (state, options.json) {
@@ -1068,6 +1076,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!("Cleanup complete: {:?}", state.phase);
             }
+        }
+        [cmd, sub] if cmd == "boot" && sub == "cleanup" => {
+            return Err(format!(
+                "boot cleanup requires typed confirmation: nousb boot cleanup \"{CLEANUP_CONFIRMATION_PHRASE}\""
+            )
+            .into());
         }
         [cmd, plan_kind, profile] if cmd == "execute" => {
             let kind = parse_plan_kind(plan_kind)?;

@@ -534,20 +534,28 @@ fn host_preflight(
         _ => {}
     }
     if let Some(fs_name) = facts.staging_filesystem.as_deref() {
+        let fs_lower = fs_name.to_ascii_lowercase();
         if !matches!(
-            fs_name.to_ascii_lowercase().as_str(),
+            fs_lower.as_str(),
             "ntfs" | "ext4" | "ext3" | "ext2" | "btrfs" | "xfs" | "vfat" | "fat32" | "exfat"
         ) {
             blockers.push(format!(
                 "staging filesystem {fs_name} is not known to be readable by the official GRUB"
             ));
         }
-        if fs_name.eq_ignore_ascii_case("ntfs") && family == LiveBootFamily::Dracut {
+        const FAT32_MAX_FILE_BYTES: u64 = 0xFFFF_FFFF;
+        if matches!(fs_lower.as_str(), "vfat" | "fat32") && iso_size_bytes > FAT32_MAX_FILE_BYTES {
+            let iso_gib = iso_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            blockers.push(format!(
+                "staging filesystem {fs_name} has a 4 GiB single-file limit; this ISO is {iso_gib:.1} GiB (choose another staging volume with --staging-root)"
+            ));
+        }
+        if fs_lower == "ntfs" && family == LiveBootFamily::Dracut {
             blockers.push(
                 "dracut live images cannot loop-mount an ISO from NTFS; stage it on an ext4/FAT/exFAT volume with --staging-root".into(),
             );
         }
-        if fs_name.eq_ignore_ascii_case("ntfs") && family == LiveBootFamily::Casper {
+        if fs_lower == "ntfs" && family == LiveBootFamily::Casper {
             warnings.push(
                 "casper must mount NTFS from its initramfs to find the ISO; this is a physical-test item (see docs/PHYSICAL_TESTING.md)".into(),
             );
@@ -891,6 +899,53 @@ fn run_arm_steps(
     state.boot_order_before = backend.boot_order()?;
     save_state(base_dir, state, "boot state backed up")?;
 
+    let mount = backend.mount_esp()?;
+    state.esp_mount = Some(mount.clone());
+    save_state(base_dir, state, &format!("ESP at {}", mount.path.display()))?;
+    let needed: u64 = 64 * 1024 * 1024;
+    if let Some(free) = backend.esp_free_bytes(&mount)? {
+        if free < needed {
+            return Err(NoUsbError::UnsafeExecution(format!(
+                "ESP has {} MiB free; at least {} MiB is required",
+                free / (1024 * 1024),
+                needed / (1024 * 1024)
+            )));
+        }
+    }
+    let efi_dir = mount.path.join("EFI");
+    if !efi_dir.is_dir() {
+        return Err(NoUsbError::UnsafeExecution(format!(
+            "{} has no EFI directory; this does not look like an EFI System Partition",
+            mount.path.display()
+        )));
+    }
+    let loader_dir_rel = format!("EFI/{HOST_BOOT_ESP_DIR}");
+    let loader_dir = mount.path.join(relative_native(&loader_dir_rel));
+    if loader_dir.exists() {
+        return Err(NoUsbError::UnsafeExecution(format!(
+            "{} already exists; refusing to overwrite (run `nousb boot cleanup` or inspect it)",
+            loader_dir.display()
+        )));
+    }
+    if plan.write_disk_info {
+        for relative in [".disk/info", "boot/grub/grub.cfg"] {
+            let target = mount.path.join(relative_native(relative));
+            if target.exists() {
+                return Err(NoUsbError::UnsafeExecution(format!(
+                    "{} already exists on the ESP; refusing to overwrite it",
+                    target.display()
+                )));
+            }
+        }
+    }
+
+    // Unmount ESP right after checks so it does not stay mounted during the multi-GB copy.
+    if mount.mounted_by_us {
+        backend.unmount_esp(&mount)?;
+    }
+    state.esp_mount = None;
+    save_state(base_dir, state, "ESP pre-checks passed")?;
+
     // Staging volume: NoUSB/<token>/<iso> plus the marker GRUB searches for.
     let staging_parent = plan.staging_volume_root.join(HOST_BOOT_STAGING_DIR);
     if !staging_parent.exists() {
@@ -932,32 +987,13 @@ fn run_arm_steps(
 
     let mount = backend.mount_esp()?;
     state.esp_mount = Some(mount.clone());
-    save_state(base_dir, state, &format!("ESP at {}", mount.path.display()))?;
-    let needed: u64 = 64 * 1024 * 1024;
-    if let Some(free) = backend.esp_free_bytes(&mount)? {
-        if free < needed {
-            return Err(NoUsbError::UnsafeExecution(format!(
-                "ESP has {} MiB free; at least {} MiB is required",
-                free / (1024 * 1024),
-                needed / (1024 * 1024)
-            )));
-        }
-    }
-    let efi_dir = mount.path.join("EFI");
-    if !efi_dir.is_dir() {
-        return Err(NoUsbError::UnsafeExecution(format!(
-            "{} has no EFI directory; this does not look like an EFI System Partition",
-            mount.path.display()
-        )));
-    }
-    let loader_dir_rel = format!("EFI/{HOST_BOOT_ESP_DIR}");
+    save_state(
+        base_dir,
+        state,
+        &format!("ESP mounted at {}", mount.path.display()),
+    )?;
+
     let loader_dir = mount.path.join(relative_native(&loader_dir_rel));
-    if loader_dir.exists() {
-        return Err(NoUsbError::UnsafeExecution(format!(
-            "{} already exists; refusing to overwrite (run `nousb boot cleanup` or inspect it)",
-            loader_dir.display()
-        )));
-    }
     fs::create_dir(&loader_dir)?;
     state.esp_dirs.push(loader_dir_rel.clone());
     save_state(base_dir, state, "ESP loader directory created")?;
@@ -1097,34 +1133,76 @@ fn undo_transaction(
         save_state(base_dir, state, "firmware entry removed")?;
     }
 
-    if !state.esp_files.is_empty() || !state.esp_dirs.is_empty() {
+    let saved_esp_mount = state.esp_mount.clone();
+    let has_esp_items = !state.esp_files.is_empty() || !state.esp_dirs.is_empty();
+
+    if has_esp_items {
         match backend.mount_esp() {
-            Ok(mount) => {
+            Ok(cleanup_mount) => {
                 for relative in state.esp_files.iter().rev() {
-                    let path = mount.path.join(relative_native(relative));
+                    let path = cleanup_mount.path.join(relative_native(relative));
                     if let Err(error) = remove_file_if_present(&path) {
                         errors.push(format!("remove {}: {error}", path.display()));
                     }
                 }
                 for relative in state.esp_dirs.iter().rev() {
-                    let path = mount.path.join(relative_native(relative));
+                    let path = cleanup_mount.path.join(relative_native(relative));
                     if let Err(error) = remove_dir_if_empty(&path) {
                         errors.push(format!("remove {}: {error}", path.display()));
                     }
                 }
-                if mount.mounted_by_us {
-                    if let Err(error) = backend.unmount_esp(&mount) {
+                let mut unmount_ok = true;
+                if cleanup_mount.mounted_by_us {
+                    if let Err(error) = backend.unmount_esp(&cleanup_mount) {
                         errors.push(format!("unmount ESP: {error}"));
+                        unmount_ok = false;
                     }
+                }
+                if let Some(ref saved) = saved_esp_mount {
+                    if saved.mounted_by_us && saved.path != cleanup_mount.path {
+                        if let Err(error) = backend.unmount_esp(saved) {
+                            errors.push(format!(
+                                "unmount saved ESP {}: {error}",
+                                saved.path.display()
+                            ));
+                            unmount_ok = false;
+                        }
+                    }
+                }
+                if unmount_ok {
+                    state.esp_mount = None;
                 }
                 if errors.is_empty() {
                     state.esp_files.clear();
                     state.esp_dirs.clear();
                 }
             }
-            Err(error) => errors.push(format!("mount ESP for cleanup: {error}")),
+            Err(error) => {
+                errors.push(format!("mount ESP for cleanup: {error}"));
+                if let Some(ref saved) = saved_esp_mount {
+                    if saved.mounted_by_us {
+                        if let Err(unmount_error) = backend.unmount_esp(saved) {
+                            errors.push(format!(
+                                "unmount saved ESP {}: {unmount_error}",
+                                saved.path.display()
+                            ));
+                        } else {
+                            state.esp_mount = None;
+                        }
+                    }
+                }
+            }
         }
         save_state(base_dir, state, "ESP files removed")?;
+    } else if let Some(ref saved) = saved_esp_mount {
+        if saved.mounted_by_us {
+            if let Err(error) = backend.unmount_esp(saved) {
+                errors.push(format!("unmount ESP {}: {error}", saved.path.display()));
+            } else {
+                state.esp_mount = None;
+            }
+            save_state(base_dir, state, "ESP unmounted")?;
+        }
     }
 
     for path in state.created_files.iter().rev() {
@@ -1302,6 +1380,7 @@ pub struct FakeHostBootBackend {
     pub boot_next: Option<String>,
     pub fail_on: Option<String>,
     pub mounted: bool,
+    pub mounted_paths: Vec<PathBuf>,
 }
 
 impl FakeHostBootBackend {
@@ -1317,6 +1396,7 @@ impl FakeHostBootBackend {
             boot_next: None,
             fail_on: None,
             mounted: false,
+            mounted_paths: Vec::new(),
         }
     }
 
@@ -1351,16 +1431,25 @@ impl HostBootBackend for FakeHostBootBackend {
 
     fn mount_esp(&mut self) -> Result<EspMount, NoUsbError> {
         self.check("mount")?;
-        self.mounted = true;
+        if !self.mounted_paths.contains(&self.esp_dir) {
+            self.mounted_paths.push(self.esp_dir.clone());
+        }
+        self.mounted = !self.mounted_paths.is_empty();
         Ok(EspMount {
             path: self.esp_dir.clone(),
             mounted_by_us: true,
         })
     }
 
-    fn unmount_esp(&mut self, _mount: &EspMount) -> Result<(), NoUsbError> {
+    fn unmount_esp(&mut self, mount: &EspMount) -> Result<(), NoUsbError> {
         self.check("unmount")?;
-        self.mounted = false;
+        if !mount.mounted_by_us {
+            return Ok(());
+        }
+        if let Some(pos) = self.mounted_paths.iter().position(|p| p == &mount.path) {
+            self.mounted_paths.remove(pos);
+        }
+        self.mounted = !self.mounted_paths.is_empty();
         Ok(())
     }
 
@@ -1519,6 +1608,38 @@ mod tests {
     }
 
     #[test]
+    fn fat32_staging_blocks_large_iso() {
+        let dir = std::env::temp_dir().join(format!("nousb-hb-fat32-{}", std::process::id()));
+        let mut host = facts(&dir);
+        host.staging_filesystem = Some("vfat".into());
+        let plan = plan_host_one_shot(
+            "ubuntu-24.04-desktop",
+            &dir.join("missing.iso"),
+            &host,
+            "fake",
+            true,
+        )
+        .unwrap();
+        assert!(!plan.ready());
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("4 GiB single-file limit")));
+        assert!(plan
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("this ISO is 6.2 GiB")));
+
+        let (blockers, _) = host_preflight(
+            &host,
+            LiveBootFamily::Casper,
+            (4.5 * 1024.0 * 1024.0 * 1024.0) as u64,
+            true,
+        );
+        assert!(blockers.iter().any(|b| b.contains("this ISO is 4.5 GiB")));
+    }
+
+    #[test]
     fn arm_refuses_wrong_phrase_and_preflight_blockers() {
         let dir = std::env::temp_dir().join(format!("nousb-hb-arm-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -1658,6 +1779,10 @@ mod tests {
             assert_eq!(state.phase, HostBootPhase::RolledBack, "{failure}");
             assert!(backend.boot_next.is_none(), "{failure}");
             assert_eq!(backend.entries.len(), 2, "{failure}");
+            assert!(
+                !backend.mounted,
+                "{failure}: ESP was not unmounted on rollback"
+            );
             assert!(!esp.join("EFI").join("NoUSB").exists(), "{failure}");
             assert!(!dir.join("NoUSB").exists(), "{failure}");
             let _ = fs::remove_dir_all(&dir);
@@ -1687,6 +1812,14 @@ mod tests {
             "user file"
         );
         assert!(backend.boot_next.is_none());
+        assert!(
+            !backend.mounted,
+            "ESP was not unmounted when loader dir already existed"
+        );
+        assert!(
+            !dir.join("NoUSB").exists(),
+            "staging directory should not be created if ESP check fails fast"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1741,6 +1874,147 @@ mod tests {
         assert_eq!(backend.boot_order, vec!["0000", "0001"]);
         // Second run is a no-op.
         cleanup_host_one_shot(&dir, &mut backend, CLEANUP_CONFIRMATION_PHRASE).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_disk_info_and_grub_cfg_fail_fast_before_staging() {
+        for (rel_dir, file_name) in [(".disk", "info"), ("boot/grub", "grub.cfg")] {
+            let dir = std::env::temp_dir().join(format!(
+                "nousb-hb-collision-{}-{}-{}",
+                rel_dir.replace('/', "-"),
+                file_name,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let esp = dir.join("esp");
+            let target_dir = esp.join(relative_native(rel_dir));
+            fs::create_dir_all(&target_dir).unwrap();
+            fs::create_dir_all(esp.join("EFI")).unwrap();
+            let target_file = target_dir.join(file_name);
+            fs::write(&target_file, "existing file content").unwrap();
+
+            let plan = fixture_plan(&dir);
+            assert!(plan.write_disk_info);
+            let mut backend = FakeHostBootBackend::new(facts(&dir), esp.clone());
+            let error = arm_with_extractor(
+                &dir,
+                &plan,
+                &mut backend,
+                &plan.confirmation_phrase,
+                &fake_extract,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("already exists on the ESP"),
+                "expected collision error, got: {error}"
+            );
+            assert_eq!(
+                fs::read_to_string(&target_file).unwrap(),
+                "existing file content",
+                "existing file was overwritten"
+            );
+            assert!(
+                !backend.mounted,
+                "ESP was not unmounted when collision occurred"
+            );
+            assert!(
+                !dir.join("NoUSB").exists(),
+                "staging directory should not be created if ESP check fails fast"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn cleanup_after_crash_unmounts_saved_mount_path_in_fresh_backend() {
+        let dir = std::env::temp_dir().join(format!("nousb-hb-crash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let esp_x = dir.join("esp-x");
+        let esp_y = dir.join("esp-y");
+        fs::create_dir_all(esp_x.join("EFI").join("NoUSB")).unwrap();
+        fs::write(esp_x.join("EFI").join("NoUSB").join("grub.cfg"), "grub").unwrap();
+        fs::create_dir_all(esp_y.join("EFI").join("NoUSB")).unwrap();
+        fs::write(esp_y.join("EFI").join("NoUSB").join("grub.cfg"), "grub").unwrap();
+
+        // Process 1 crashed while ESP was mounted at esp_x
+        let mut state = HostBootState {
+            plan_id: "crash-test".into(),
+            profile_id: "ubuntu-24.04-desktop".into(),
+            backend: "fake".into(),
+            phase: HostBootPhase::Preparing,
+            boot_order_before: vec!["0000".into(), "0001".into()],
+            entry_id: None,
+            armed: false,
+            esp_mount: Some(EspMount {
+                path: esp_x.clone(),
+                mounted_by_us: true,
+            }),
+            created_files: vec![],
+            created_dirs: vec![],
+            esp_files: vec!["EFI/NoUSB/grub.cfg".into()],
+            esp_dirs: vec!["EFI/NoUSB".into()],
+            backup_files: vec![],
+            events: vec![],
+            updated_at: 0,
+        };
+        save_state(&dir, &mut state, "process 1 crashed").unwrap();
+
+        // Process 2 restarts with a fresh backend; esp_x was left mounted by the crashed process
+        let mut backend2 = FakeHostBootBackend::new(facts(&dir), esp_y.clone());
+        backend2.mounted_paths = vec![esp_x.clone()];
+        backend2.mounted = true;
+
+        let cleaned =
+            cleanup_host_one_shot(&dir, &mut backend2, CLEANUP_CONFIRMATION_PHRASE).unwrap();
+        assert_eq!(cleaned.phase, HostBootPhase::CleanedUp);
+        assert!(
+            backend2.mounted_paths.is_empty(),
+            "both the new mount and the saved mount from before the crash should be unmounted: {:?}",
+            backend2.mounted_paths
+        );
+        assert!(!backend2.mounted);
+        assert_eq!(load_host_boot_state(&dir).unwrap().unwrap().esp_mount, None);
+
+        // Also test crash when esp_files is empty (e.g. process crashed before extracting loaders)
+        let mut state_empty = HostBootState {
+            plan_id: "crash-empty".into(),
+            profile_id: "ubuntu-24.04-desktop".into(),
+            backend: "fake".into(),
+            phase: HostBootPhase::Preparing,
+            boot_order_before: vec!["0000".into(), "0001".into()],
+            entry_id: None,
+            armed: false,
+            esp_mount: Some(EspMount {
+                path: esp_x.clone(),
+                mounted_by_us: true,
+            }),
+            created_files: vec![],
+            created_dirs: vec![],
+            esp_files: vec![],
+            esp_dirs: vec![],
+            backup_files: vec![],
+            events: vec![],
+            updated_at: 0,
+        };
+        save_state(&dir, &mut state_empty, "crashed before files staged").unwrap();
+
+        let mut backend3 = FakeHostBootBackend::new(facts(&dir), esp_y.clone());
+        backend3.mounted_paths = vec![esp_x.clone()];
+        backend3.mounted = true;
+
+        let cleaned =
+            cleanup_host_one_shot(&dir, &mut backend3, CLEANUP_CONFIRMATION_PHRASE).unwrap();
+        assert_eq!(cleaned.phase, HostBootPhase::CleanedUp);
+        assert!(
+            backend3.mounted_paths.is_empty(),
+            "saved mount should be unmounted directly without calling mount_esp: {:?}",
+            backend3.mounted_paths
+        );
+        assert!(!backend3.mounted);
+        assert_eq!(load_host_boot_state(&dir).unwrap().unwrap().esp_mount, None);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
