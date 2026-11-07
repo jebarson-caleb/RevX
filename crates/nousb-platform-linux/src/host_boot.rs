@@ -168,6 +168,12 @@ pub fn linux_host_boot_facts(
         .run_checked("lsblk", &["-nso", "TYPE", &device])
         .ok()
         .map(|types| types.lines().any(|kind| kind.trim() == "crypt"));
+    // `run` fails only when the program cannot be started at all.
+    let missing_tools = ["efibootmgr"]
+        .into_iter()
+        .filter(|tool| runner.run(tool, &["--version"]).is_err())
+        .map(String::from)
+        .collect();
     let free = runner
         .run_checked("df", &["-PB1", "--", &root])
         .ok()
@@ -183,6 +189,7 @@ pub fn linux_host_boot_facts(
         staging_filesystem: Some(row.fstype.clone()),
         staging_volume_encrypted: encrypted,
         staging_free_bytes: free,
+        missing_tools,
     })
 }
 

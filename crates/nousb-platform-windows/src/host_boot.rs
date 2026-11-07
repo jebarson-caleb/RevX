@@ -24,6 +24,7 @@ pub fn parse_windows_host_facts(stdout: &str, staging_root: &Path) -> HostBootFa
         staging_filesystem: None,
         staging_volume_encrypted: None,
         staging_free_bytes: None,
+        missing_tools: vec![],
     };
     let mut manage_bde = String::new();
     for line in stdout.lines() {
