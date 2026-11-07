@@ -890,9 +890,6 @@ fn run_arm_steps(
     state: &mut HostBootState,
     extract: LoaderExtractor<'_>,
 ) -> Result<(), NoUsbError> {
-    verify_file(&plan.iso_path, plan.iso_size_bytes, &plan.iso_sha256)?;
-    save_state(base_dir, state, "source ISO re-verified")?;
-
     let backup_dir = host_boot_dir(base_dir).join(&plan.id).join("backup");
     fs::create_dir_all(&backup_dir)?;
     state.backup_files = backend.backup_boot_state(&backup_dir)?;
@@ -945,6 +942,10 @@ fn run_arm_steps(
     }
     state.esp_mount = None;
     save_state(base_dir, state, "ESP pre-checks passed")?;
+
+    // Hash the multi-GiB source only after the cheap ESP checks have passed.
+    verify_file(&plan.iso_path, plan.iso_size_bytes, &plan.iso_sha256)?;
+    save_state(base_dir, state, "source ISO re-verified")?;
 
     // Staging volume: NoUSB/<token>/<iso> plus the marker GRUB searches for.
     let staging_parent = plan.staging_volume_root.join(HOST_BOOT_STAGING_DIR);
@@ -1137,7 +1138,17 @@ fn undo_transaction(
     let has_esp_items = !state.esp_files.is_empty() || !state.esp_dirs.is_empty();
 
     if has_esp_items {
-        match backend.mount_esp() {
+        // After a crash, the mount the dead process made may still be live. Reuse it rather than
+        // mounting the ESP a second time (Windows `mountvol /S` may refuse an already-lettered ESP).
+        let reusable = saved_esp_mount
+            .as_ref()
+            .filter(|saved| saved.mounted_by_us && saved.path.join("EFI").is_dir())
+            .cloned();
+        let cleanup_mount = match reusable {
+            Some(saved) => Ok(saved),
+            None => backend.mount_esp(),
+        };
+        match cleanup_mount {
             Ok(cleanup_mount) => {
                 for relative in state.esp_files.iter().rev() {
                     let path = cleanup_mount.path.join(relative_native(relative));
@@ -1975,6 +1986,10 @@ mod tests {
             backend2.mounted_paths
         );
         assert!(!backend2.mounted);
+        assert!(
+            !esp_x.join("EFI").join("NoUSB").exists(),
+            "cleanup should reuse the still-live saved mount instead of mounting again"
+        );
         assert_eq!(load_host_boot_state(&dir).unwrap().unwrap().esp_mount, None);
 
         // Also test crash when esp_files is empty (e.g. process crashed before extracting loaders)
