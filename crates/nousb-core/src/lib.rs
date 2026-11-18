@@ -9,6 +9,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
 use reqwest::redirect::Policy;
 use reqwest::StatusCode;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 mod boot_hints;
@@ -1778,48 +1779,88 @@ pub fn embedded_profiles() -> Result<Vec<InstallerProfile>, NoUsbError> {
         .collect()
 }
 
+/// The profile file as written on disk. Unknown fields are rejected so a typo cannot silently
+/// drop a pinned value; the checks in `validate_profile` run on the converted profile.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInstallerProfile {
+    schema_version: String,
+    id: String,
+    name: String,
+    vendor: String,
+    version: String,
+    architecture: String,
+    source_url: String,
+    checksum_url: String,
+    sha256: String,
+    artifact_filename: Option<String>,
+    artifact_size_bytes: Option<RawSize>,
+    signature_url: Option<String>,
+    signing_key: Option<String>,
+    homepage: String,
+    license_notes: String,
+    supported_platforms: Vec<String>,
+    supported_staging_strategies: Vec<String>,
+    required_free_space_gb: u32,
+    extraction_rules: Vec<String>,
+    kernel_initrd_paths: Vec<String>,
+    bootloader_paths: Vec<String>,
+    secure_boot_notes: String,
+    known_limitations: Vec<String>,
+    post_boot_instructions: String,
+}
+
+/// Byte sizes are written as quoted strings in the shipped profiles; plain integers also work.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawSize {
+    Number(u64),
+    Text(String),
+}
+
 pub fn parse_installer_profile(source: &str) -> Result<InstallerProfile, NoUsbError> {
-    let fields = ProfileFields::parse(source)?;
-    let artifact_size_bytes = fields
-        .optional("artifact_size_bytes")
-        .map(|value| {
-            value.parse::<u64>().map_err(|error| {
-                NoUsbError::ProfileParse(format!("artifact_size_bytes is invalid: {error}"))
-            })
-        })
-        .transpose()?
-        .filter(|value| *value > 0);
+    let raw: RawInstallerProfile =
+        toml::from_str(source).map_err(|error| NoUsbError::ProfileParse(error.to_string()))?;
+    let artifact_size_bytes = match raw.artifact_size_bytes {
+        None => None,
+        Some(RawSize::Number(value)) => Some(value),
+        Some(RawSize::Text(value)) if value.is_empty() => None,
+        Some(RawSize::Text(value)) => Some(value.parse::<u64>().map_err(|error| {
+            NoUsbError::ProfileParse(format!("artifact_size_bytes is invalid: {error}"))
+        })?),
+    }
+    .filter(|value| *value > 0);
+    // An empty string means "not set" for the optional fields.
+    let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
     let profile = InstallerProfile {
-        schema_version: fields.required("schema_version")?,
-        id: fields.required("id")?,
-        name: fields.required("name")?,
-        vendor: fields.required("vendor")?,
-        version: fields.required("version")?,
-        architecture: fields.required("architecture")?,
-        source_url: fields.required("source_url")?,
-        checksum_url: fields.required("checksum_url")?,
-        sha256: fields.required("sha256")?,
-        artifact_filename: fields.optional("artifact_filename"),
+        schema_version: raw.schema_version,
+        id: raw.id,
+        name: raw.name,
+        vendor: raw.vendor,
+        version: raw.version,
+        architecture: raw.architecture,
+        source_url: raw.source_url,
+        checksum_url: raw.checksum_url,
+        sha256: raw.sha256,
+        artifact_filename: non_empty(raw.artifact_filename),
         artifact_size_bytes,
-        signature_url: fields.optional("signature_url"),
-        signing_key: fields.optional("signing_key"),
-        homepage: fields.required("homepage")?,
-        license_notes: fields.required("license_notes")?,
-        supported_platforms: fields.array("supported_platforms")?,
-        supported_staging_strategies: fields
-            .array("supported_staging_strategies")?
+        signature_url: non_empty(raw.signature_url),
+        signing_key: non_empty(raw.signing_key),
+        homepage: raw.homepage,
+        license_notes: raw.license_notes,
+        supported_platforms: raw.supported_platforms,
+        supported_staging_strategies: raw
+            .supported_staging_strategies
             .iter()
             .map(|value| StagingStrategy::from_profile_value(value))
             .collect::<Result<Vec<_>, _>>()?,
-        required_free_space_gb: fields.required("required_free_space_gb")?.parse().map_err(
-            |error| NoUsbError::ProfileParse(format!("required_free_space_gb is invalid: {error}")),
-        )?,
-        extraction_rules: fields.array("extraction_rules")?,
-        kernel_initrd_paths: fields.array("kernel_initrd_paths")?,
-        bootloader_paths: fields.array("bootloader_paths")?,
-        secure_boot_notes: fields.required("secure_boot_notes")?,
-        known_limitations: fields.array("known_limitations")?,
-        post_boot_instructions: fields.required("post_boot_instructions")?,
+        required_free_space_gb: raw.required_free_space_gb,
+        extraction_rules: raw.extraction_rules,
+        kernel_initrd_paths: raw.kernel_initrd_paths,
+        bootloader_paths: raw.bootloader_paths,
+        secure_boot_notes: raw.secure_boot_notes,
+        known_limitations: raw.known_limitations,
+        post_boot_instructions: raw.post_boot_instructions,
     };
     validate_profile(&profile)?;
     Ok(profile)
@@ -3345,163 +3386,6 @@ fn unique_plan_stamp() -> String {
     format!("{}-{:09}", elapsed.as_secs(), elapsed.subsec_nanos())
 }
 
-#[derive(Debug)]
-struct ProfileFields {
-    values: Vec<(String, ProfileValue)>,
-}
-
-#[derive(Debug)]
-enum ProfileValue {
-    String(String),
-    Array(Vec<String>),
-}
-
-impl ProfileFields {
-    fn parse(source: &str) -> Result<Self, NoUsbError> {
-        let mut values = Vec::new();
-        for (index, raw_line) in source.lines().enumerate() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((raw_key, raw_value)) = line.split_once('=') else {
-                return Err(NoUsbError::ProfileParse(format!(
-                    "line {} is missing '='",
-                    index + 1
-                )));
-            };
-            let key = raw_key.trim().to_string();
-            let value = parse_profile_value(raw_value.trim()).map_err(|error| {
-                NoUsbError::ProfileParse(format!("line {} for key {key}: {error}", index + 1))
-            })?;
-            values.push((key, value));
-        }
-        Ok(Self { values })
-    }
-
-    fn required(&self, key: &str) -> Result<String, NoUsbError> {
-        match self.value(key) {
-            Some(ProfileValue::String(value)) => Ok(value.clone()),
-            Some(ProfileValue::Array(_)) => Err(NoUsbError::ProfileParse(format!(
-                "{key} must be a string value"
-            ))),
-            None => Err(NoUsbError::ProfileParse(format!(
-                "missing required field {key}"
-            ))),
-        }
-    }
-
-    fn optional(&self, key: &str) -> Option<String> {
-        match self.value(key) {
-            Some(ProfileValue::String(value)) if !value.is_empty() => Some(value.clone()),
-            _ => None,
-        }
-    }
-
-    fn array(&self, key: &str) -> Result<Vec<String>, NoUsbError> {
-        match self.value(key) {
-            Some(ProfileValue::Array(value)) => Ok(value.clone()),
-            Some(ProfileValue::String(_)) => Err(NoUsbError::ProfileParse(format!(
-                "{key} must be an array value"
-            ))),
-            None => Err(NoUsbError::ProfileParse(format!(
-                "missing required field {key}"
-            ))),
-        }
-    }
-
-    fn value(&self, key: &str) -> Option<&ProfileValue> {
-        self.values
-            .iter()
-            .find_map(|(candidate, value)| (candidate == key).then_some(value))
-    }
-}
-
-fn parse_profile_value(source: &str) -> Result<ProfileValue, String> {
-    if source.starts_with('"') {
-        parse_quoted_string(source).map(ProfileValue::String)
-    } else if source.starts_with('[') {
-        parse_string_array(source).map(ProfileValue::Array)
-    } else {
-        Ok(ProfileValue::String(source.to_string()))
-    }
-}
-
-fn parse_quoted_string(source: &str) -> Result<String, String> {
-    let trimmed = source.trim();
-    if !trimmed.starts_with('"') || !trimmed.ends_with('"') {
-        return Err("quoted string must start and end with double quotes".into());
-    }
-    Ok(unescape_profile_string(&trimmed[1..trimmed.len() - 1]))
-}
-
-fn parse_string_array(source: &str) -> Result<Vec<String>, String> {
-    let trimmed = source.trim();
-    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-        return Err("array must start with '[' and end with ']'".into());
-    }
-    let inner = trimmed[1..trimmed.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let mut values = Vec::new();
-    let mut current = String::new();
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for character in inner.chars() {
-        if escaped {
-            current.push(character);
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' if in_string => escaped = true,
-            '"' => {
-                in_string = !in_string;
-                current.push(character);
-            }
-            ',' if !in_string => {
-                values.push(parse_quoted_string(current.trim())?);
-                current.clear();
-            }
-            _ => current.push(character),
-        }
-    }
-
-    if in_string {
-        return Err("unterminated string in array".into());
-    }
-    if !current.trim().is_empty() {
-        values.push(parse_quoted_string(current.trim())?);
-    }
-    Ok(values)
-}
-
-fn unescape_profile_string(source: &str) -> String {
-    let mut output = String::new();
-    let mut escaped = false;
-    for character in source.chars() {
-        if escaped {
-            match character {
-                'n' => output.push('\n'),
-                'r' => output.push('\r'),
-                't' => output.push('\t'),
-                '"' => output.push('"'),
-                '\\' => output.push('\\'),
-                other => output.push(other),
-            }
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else {
-            output.push(character);
-        }
-    }
-    output
-}
-
 fn json_pair(key: &str, value: &str) -> String {
     format!("\"{}\":\"{}\"", escape_json(key), escape_json(value))
 }
@@ -3627,6 +3511,51 @@ mod tests {
         assert!(profiles
             .iter()
             .any(|profile| profile.supported_platforms.contains(&"linux_uefi".into())));
+    }
+
+    /// Pins every field of every embedded profile. Set `NOUSB_UPDATE_SNAPSHOTS=1` to rewrite it
+    /// after an intended profile change, then review the diff like any other pinned data.
+    #[test]
+    fn embedded_profiles_match_snapshot() {
+        let actual = format!("{:#?}\n", embedded_profiles().unwrap());
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/snapshots/embedded_profiles.txt"
+        );
+        if std::env::var_os("NOUSB_UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(path, &actual).unwrap();
+        }
+        // Git may check the snapshot out with CRLF line endings.
+        let expected = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn profile_parsing_rejects_unknown_fields() {
+        let source = include_str!("../../nousb-installer-profiles/profiles/windows-11.toml");
+        let result = parse_installer_profile(&format!("{source}\nsurprise = \"value\"\n"));
+        let message = match result {
+            Err(NoUsbError::ProfileParse(message)) => message,
+            other => panic!("expected a profile parse error, got {other:?}"),
+        };
+        assert!(message.contains("surprise"), "{message}");
+    }
+
+    #[test]
+    fn profile_parsing_rejects_malformed_toml_and_wrong_types() {
+        let source = include_str!("../../nousb-installer-profiles/profiles/windows-11.toml");
+        assert!(matches!(
+            parse_installer_profile("schema_version = \"1\"\nid"),
+            Err(NoUsbError::ProfileParse(_))
+        ));
+        let wrong_type = source.replace(
+            "required_free_space_gb = ",
+            "required_free_space_gb = \"x\" #",
+        );
+        assert!(matches!(
+            parse_installer_profile(&wrong_type),
+            Err(NoUsbError::ProfileParse(_))
+        ));
     }
 
     #[test]
