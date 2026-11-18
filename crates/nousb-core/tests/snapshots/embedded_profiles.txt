@@ -1,0 +1,190 @@
+[
+    InstallerProfile {
+        schema_version: "1",
+        id: "ubuntu-24.04-desktop",
+        name: "Ubuntu Desktop",
+        vendor: "Canonical",
+        version: "24.04.4 LTS",
+        architecture: "x86_64",
+        source_url: "https://releases.ubuntu.com/24.04/ubuntu-24.04.4-desktop-amd64.iso",
+        checksum_url: "https://releases.ubuntu.com/24.04/SHA256SUMS",
+        sha256: "3a4c9877b483ab46d7c3fbe165a0db275e1ae3cfe56a5657e5a47c2f99a99d1e",
+        artifact_filename: Some(
+            "ubuntu-24.04.4-desktop-amd64.iso",
+        ),
+        artifact_size_bytes: Some(
+            6655619072,
+        ),
+        signature_url: Some(
+            "https://releases.ubuntu.com/24.04/SHA256SUMS.gpg",
+        ),
+        signing_key: Some(
+            "ubuntu-cdimage-2012",
+        ),
+        homepage: "https://ubuntu.com",
+        license_notes: "Use Canonical's official download and license terms.",
+        supported_platforms: [
+            "windows_uefi",
+            "linux_uefi",
+        ],
+        supported_staging_strategies: [
+            IsoLoopback,
+            KernelInitrd,
+        ],
+        required_free_space_gb: 8,
+        extraction_rules: [
+            "preserve_official_iso_contents",
+            "do_not_modify_signed_boot_assets",
+        ],
+        kernel_initrd_paths: [
+            "/casper/vmlinuz",
+            "/casper/initrd",
+        ],
+        bootloader_paths: [
+            "/EFI/BOOT/BOOTX64.EFI",
+            "/EFI/BOOT/grubx64.efi",
+        ],
+        secure_boot_notes: "Use official signed Ubuntu boot assets. Stop if firmware rejects them.",
+        known_limitations: [
+            "Real boot changes remain disabled in the default build.",
+            "Full-media toram boot needs substantial memory beyond the 6.2 GiB ISO size.",
+        ],
+        post_boot_instructions: "Use the official Ubuntu installer to try, install alongside, or replace the current OS.",
+    },
+    InstallerProfile {
+        schema_version: "1",
+        id: "ubuntu-24.04-server",
+        name: "Ubuntu Server",
+        vendor: "Canonical",
+        version: "24.04.4 LTS",
+        architecture: "x86_64",
+        source_url: "https://releases.ubuntu.com/24.04/ubuntu-24.04.4-live-server-amd64.iso",
+        checksum_url: "https://releases.ubuntu.com/24.04/SHA256SUMS",
+        sha256: "e907d92eeec9df64163a7e454cbc8d7755e8ddc7ed42f99dbc80c40f1a138433",
+        artifact_filename: Some(
+            "ubuntu-24.04.4-live-server-amd64.iso",
+        ),
+        artifact_size_bytes: Some(
+            3405469696,
+        ),
+        signature_url: Some(
+            "https://releases.ubuntu.com/24.04/SHA256SUMS.gpg",
+        ),
+        signing_key: Some(
+            "ubuntu-cdimage-2012",
+        ),
+        homepage: "https://ubuntu.com/server",
+        license_notes: "Use Canonical's official download and license terms.",
+        supported_platforms: [
+            "windows_uefi",
+            "linux_uefi",
+        ],
+        supported_staging_strategies: [
+            IsoLoopback,
+            KernelInitrd,
+        ],
+        required_free_space_gb: 5,
+        extraction_rules: [
+            "preserve_official_iso_contents",
+            "do_not_modify_signed_boot_assets",
+        ],
+        kernel_initrd_paths: [
+            "/casper/vmlinuz",
+            "/casper/initrd",
+        ],
+        bootloader_paths: [
+            "/EFI/BOOT/BOOTX64.EFI",
+            "/EFI/BOOT/grubx64.efi",
+            "/EFI/BOOT/mmx64.efi",
+        ],
+        secure_boot_notes: "Use official signed Ubuntu boot assets. Stop if firmware rejects them.",
+        known_limitations: [
+            "Real host boot changes remain disabled in the default build.",
+            "The live server ISO is used to prove the network-to-RAM installer path; it does not install a desktop environment by default.",
+        ],
+        post_boot_instructions: "Use the official Subiquity installer interactively; never expose a host disk until the disposable recovery matrix passes.",
+    },
+    InstallerProfile {
+        schema_version: "1",
+        id: "fedora-44-workstation",
+        name: "Fedora Workstation",
+        vendor: "Fedora Project",
+        version: "44",
+        architecture: "x86_64",
+        source_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso",
+        checksum_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-44-1.7-x86_64-CHECKSUM",
+        sha256: "1620295f6a00c27c3208f0c00b8ece4eab1ec69b9002152d97488bf26a426ddf",
+        artifact_filename: Some(
+            "Fedora-Workstation-Live-44-1.7.x86_64.iso",
+        ),
+        artifact_size_bytes: Some(
+            2851612672,
+        ),
+        signature_url: Some(
+            "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-44-1.7-x86_64-CHECKSUM",
+        ),
+        signing_key: Some(
+            "fedora-44",
+        ),
+        homepage: "https://fedoraproject.org/workstation/",
+        license_notes: "Use Fedora's official download, OpenPGP signature, and licensing information.",
+        supported_platforms: [
+            "windows_uefi",
+            "linux_uefi",
+        ],
+        supported_staging_strategies: [
+            IsoLoopback,
+        ],
+        required_free_space_gb: 8,
+        extraction_rules: [
+            "preserve_official_iso_contents",
+            "do_not_modify_signed_boot_assets",
+        ],
+        kernel_initrd_paths: [],
+        bootloader_paths: [
+            "/EFI/BOOT/BOOTX64.EFI",
+        ],
+        secure_boot_notes: "Use official Fedora media and verify the signed checksum document.",
+        known_limitations: [
+            "Real boot changes remain disabled in the default build.",
+            "The current staging model does not yet declare Fedora kernel/initrd paths.",
+        ],
+        post_boot_instructions: "Use the official Fedora live environment to try or install Fedora Workstation.",
+    },
+    InstallerProfile {
+        schema_version: "1",
+        id: "windows-11",
+        name: "Windows 11",
+        vendor: "Microsoft",
+        version: "current",
+        architecture: "x86_64",
+        source_url: "https://www.microsoft.com/software-download/windows11",
+        checksum_url: "https://www.microsoft.com/software-download/windows11",
+        sha256: "verify-against-microsoft-release-metadata",
+        artifact_filename: None,
+        artifact_size_bytes: None,
+        signature_url: None,
+        signing_key: None,
+        homepage: "https://www.microsoft.com/windows",
+        license_notes: "Use Microsoft's official installer, activation, and license terms.",
+        supported_platforms: [
+            "windows_uefi",
+        ],
+        supported_staging_strategies: [
+            WindowsMountedIsoSetup,
+        ],
+        required_free_space_gb: 16,
+        extraction_rules: [
+            "use_official_mounted_iso_setup_flow",
+            "do_not_modify_windows_installer_payload",
+        ],
+        kernel_initrd_paths: [],
+        bootloader_paths: [],
+        secure_boot_notes: "Use Microsoft-supported installer flows only.",
+        known_limitations: [
+            "Linux/macOS hosts show guidance only in default build.",
+            "Default build does not launch setup.exe.",
+        ],
+        post_boot_instructions: "Use the official Windows setup flow for reinstall or upgrade.",
+    },
+]

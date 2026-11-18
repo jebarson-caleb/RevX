@@ -28,6 +28,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - `nousb doctor` reports whether real boot adapters are compiled in.
 - The checked-in desktop preview fixture no longer contains local file-system paths.
+- Installer profiles are now parsed with `toml` and `serde` instead of a hand-written parser. Unknown fields in a profile are rejected, and a snapshot test pins the parsed contents of every embedded profile. The profile files and `catalog validate` output are unchanged.
 
 ## [0.1.0]
 
