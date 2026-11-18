@@ -1957,11 +1957,14 @@ pub fn artifact_status(base_dir: &Path, profile_id: &str) -> Result<ArtifactStat
     let path = artifact_cache_path(base_dir, profile_id)?;
     let size_of = |path: &Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     let partial = path.with_file_name(format!("{}.part", manifest.filename));
+    let lock_path = path.with_file_name("download.lock");
+    let state = lock_owner_state(&lock_path);
+    let downloading = matches!(state, LockOwnerState::Live | LockOwnerState::Unknown);
     Ok(ArtifactStatus {
         profile_id: manifest.profile_id,
         present: path.is_file() && size_of(&path) == manifest.size_bytes,
         partial_bytes: size_of(&partial),
-        downloading: path.with_file_name("download.lock").exists(),
+        downloading,
         path,
         size_bytes: manifest.size_bytes,
     })
@@ -2548,23 +2551,94 @@ fn verify_artifact_against_manifest(
     Ok(())
 }
 
+/// The owner status of a download lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockOwnerState {
+    /// No lock file exists on disk.
+    Unlocked,
+    /// Held by a process determined to be live.
+    Live,
+    /// The lock is stale (process is provably dead, PID <= 4, or file is empty / unparseable).
+    Stale,
+    /// Lock exists with a candidate PID, but liveness cannot be determined on this platform.
+    Unknown,
+}
+
+/// Pure, read-only query for download lock state. Never modifies or removes files.
+pub(crate) fn lock_owner_state(path: &Path) -> LockOwnerState {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => {
+            if !path.exists() {
+                return LockOwnerState::Unlocked;
+            }
+            return LockOwnerState::Unknown;
+        }
+    };
+
+    let owner = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid="))
+        .and_then(|pid| pid.parse::<u32>().ok());
+
+    match owner {
+        Some(pid) => match process_alive(pid) {
+            Some(true) => LockOwnerState::Live,
+            Some(false) => LockOwnerState::Stale,
+            None => LockOwnerState::Unknown,
+        },
+        None => {
+            // An empty or unparseable lock file has no owning process. It represents
+            // an interrupted creation or corrupted lock, so it is stale.
+            LockOwnerState::Stale
+        }
+    }
+}
+
+/// Removes a download lock file only if its state is provably stale. Used exclusively by `acquire`.
+fn remove_stale_lock(path: &Path) {
+    if lock_owner_state(path) == LockOwnerState::Stale {
+        let _ = fs::remove_file(path);
+    }
+}
+
 struct DownloadLock {
     path: PathBuf,
 }
 
 impl DownloadLock {
     fn acquire(path: PathBuf) -> Result<Self, NoUsbError> {
-        // A lock left by a download that was killed (closed window, power loss) would block
-        // every later attempt. Remove it only when its recorded process is provably gone.
-        if let Ok(text) = fs::read_to_string(&path) {
-            let owner = text
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("pid="))
-                .and_then(|pid| pid.parse::<u32>().ok());
-            if owner.and_then(process_alive) == Some(false) {
-                let _ = fs::remove_file(&path);
-            }
+        // Clean up a stale or corrupted lock before trying to acquire.
+        remove_stale_lock(&path);
+
+        let pid = std::process::id();
+        let temp_path = path.with_extension(format!("tmp.{pid}"));
+        {
+            let mut temp_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            writeln!(temp_file, "pid={pid}")?;
+            temp_file.sync_all()?;
         }
+
+        // Try atomic hard link first so download.lock never appears as an empty file.
+        let linked = fs::hard_link(&temp_path, &path);
+        let _ = fs::remove_file(&temp_path);
+
+        if linked.is_ok() {
+            return Ok(Self { path });
+        }
+
+        if path.exists() {
+            return Err(NoUsbError::Io(format!(
+                "cannot acquire download lock {} (is another download of this image running?)",
+                path.display()
+            )));
+        }
+
+        // Fallback for filesystems that do not support hard links:
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -2575,7 +2649,7 @@ impl DownloadLock {
                     path.display()
                 ))
             })?;
-        writeln!(file, "pid={}", std::process::id())?;
+        writeln!(file, "pid={pid}")?;
         file.sync_all()?;
         Ok(Self { path })
     }
@@ -2586,22 +2660,65 @@ fn process_alive(pid: u32) -> Option<bool> {
     if pid == std::process::id() {
         return Some(true);
     }
+    // PID 0 is Idle/invalid. PID 4 on Windows (and system processes <= 4) are OS kernel processes,
+    // never userland download workers.
+    if pid <= 4 {
+        return Some(false);
+    }
     if cfg!(target_os = "linux") {
         return Some(Path::new(&format!("/proc/{pid}")).exists());
     }
-    if cfg!(target_os = "windows") {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let listing = String::from_utf8_lossy(&output.stdout);
-        return Some(listing.contains(&format!("\"{pid}\"")));
+    #[cfg(target_os = "windows")]
+    {
+        return windows_process_alive(pid);
     }
+    #[allow(unreachable_code)]
     None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_alive(pid: u32) -> Option<bool> {
+    // 1. Fast path: check via Win32 API without spawning any subprocess.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(process: *mut std::ffi::c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: *mut std::ffi::c_void) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if !handle.is_null() {
+            let mut exit_code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            if ok != 0 {
+                return Some(exit_code == STILL_ACTIVE);
+            }
+        }
+    }
+
+    // 2. Fallback: tasklist.exe with CREATE_NO_WINDOW so no console window flashes.
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stdin(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Some(listing.contains(&format!("\"{pid}\"")))
 }
 
 impl Drop for DownloadLock {
@@ -4279,5 +4396,106 @@ post_boot_instructions = "None"
     fn write_both_endian_u32(target: &mut [u8], value: u32) {
         target[..4].copy_from_slice(&value.to_le_bytes());
         target[4..8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[test]
+    fn artifact_status_is_read_only_and_recognizes_stale_and_live_locks() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "nousb-status-lock-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
+        let artifact_dir = base_dir.join(".nousb/artifacts/ubuntu-24.04-server");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let lock_path = artifact_dir.join("download.lock");
+
+        // 1. Stale lock whose owning PID is provably gone.
+        // Status must report downloading = false, but must NEVER delete the file (read-only contract).
+        fs::write(&lock_path, "pid=99999999\n").unwrap();
+        let status = artifact_status(&base_dir, "ubuntu-24.04-server").unwrap();
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            assert!(
+                !status.downloading,
+                "stale lock with dead PID must report downloading = false"
+            );
+        }
+        assert!(
+            lock_path.exists(),
+            "read-only status must leave lock file in place"
+        );
+
+        // 2. Lock with system PID 4 (kernel System process) or PID 0.
+        fs::write(&lock_path, "pid=4\n").unwrap();
+        let status = artifact_status(&base_dir, "ubuntu-24.04-server").unwrap();
+        assert!(
+            !status.downloading,
+            "lock with system PID must report downloading = false"
+        );
+        assert!(
+            lock_path.exists(),
+            "read-only status must leave lock file in place"
+        );
+
+        // 3. 0-byte empty lock file (interrupted creation).
+        fs::write(&lock_path, "").unwrap();
+        let status = artifact_status(&base_dir, "ubuntu-24.04-server").unwrap();
+        assert!(
+            !status.downloading,
+            "empty lock must report downloading = false"
+        );
+        assert!(
+            lock_path.exists(),
+            "read-only status must leave empty lock file in place"
+        );
+
+        // 4. Garbage / unparseable lock file.
+        fs::write(&lock_path, "corrupted_non_numeric_garbage\n").unwrap();
+        let status = artifact_status(&base_dir, "ubuntu-24.04-server").unwrap();
+        assert!(
+            !status.downloading,
+            "garbage lock must report downloading = false"
+        );
+        assert!(
+            lock_path.exists(),
+            "read-only status must leave garbage lock file in place"
+        );
+
+        // 5. Active lock held by current process.
+        fs::write(&lock_path, format!("pid={}\n", std::process::id())).unwrap();
+        let status = artifact_status(&base_dir, "ubuntu-24.04-server").unwrap();
+        assert!(
+            status.downloading,
+            "live lock must report downloading = true"
+        );
+        assert!(lock_path.exists(), "live lock file must be preserved");
+
+        // 6. DownloadLock::acquire cleans up stale, empty, or garbage locks when acquiring.
+        fs::write(&lock_path, "pid=99999999\n").unwrap();
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            let lock = DownloadLock::acquire(lock_path.clone());
+            assert!(
+                lock.is_ok(),
+                "acquire should clean up dead PID lock and succeed"
+            );
+            drop(lock);
+        }
+
+        fs::write(&lock_path, "").unwrap();
+        let lock = DownloadLock::acquire(lock_path.clone());
+        assert!(
+            lock.is_ok(),
+            "acquire should clean up empty lock and succeed"
+        );
+        drop(lock);
+
+        fs::write(&lock_path, "invalid_garbage\n").unwrap();
+        let lock = DownloadLock::acquire(lock_path.clone());
+        assert!(
+            lock.is_ok(),
+            "acquire should clean up garbage lock and succeed"
+        );
+        drop(lock);
+
+        let _ = fs::remove_dir_all(&base_dir);
     }
 }

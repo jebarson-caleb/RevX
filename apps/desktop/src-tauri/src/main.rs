@@ -285,11 +285,14 @@ fn build_host_boot_plan(
 
 /// Read-only: whether the profile's pinned image is on disk, partly downloaded, or absent.
 #[tauri::command]
-fn image_status(profile: String) -> CommandResult {
-    let dir = project_dir()?;
-    nousb_core::artifact_status(&dir, &profile)
-        .map(|status| status.to_json())
-        .map_err(error_text)
+async fn image_status(profile: String) -> CommandResult {
+    blocking(move || {
+        let dir = project_dir()?;
+        nousb_core::artifact_status(&dir, &profile)
+            .map(|status| status.to_json())
+            .map_err(error_text)
+    })
+    .await
 }
 
 /// Downloads (or resumes) the pinned official image and verifies size and SHA-256. Writes only

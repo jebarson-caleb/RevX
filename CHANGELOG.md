@@ -19,7 +19,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Fixed
 
 - Windows hosts whose registry has no `PEFirmwareType` (seen on Windows 11 build 26300) were reported as non-UEFI, which blocked every plan. Firmware type now falls back to `%firmware_type%` and `GetFirmwareType`.
-- A download that was killed left `download.lock` behind and blocked every later download of that image. A lock whose process is gone is now removed.
+- A download that was killed left `download.lock` behind and blocked every later download of that image. `image status` now checks process liveness and reports `downloading: false` for stale, empty, or unparseable locks without modifying files, and download acquisition removes stale locks before acquiring.
 - `boot plan` reported `Ready: yes` on Linux hosts without `efibootmgr`, and arming then failed and rolled back. The plan now lists the missing tool as a blocker.
 - The plan's copy step printed the staging path without a separator (`/bootNoUSB/...`) when the staging root had no trailing slash.
 - `pnpm tauri build` failed because `@tauri-apps/api` (2.11) did not match the `tauri` crate (2.12). The npm package is now pinned to 2.12.3.

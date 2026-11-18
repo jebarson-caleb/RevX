@@ -734,6 +734,64 @@ fn boot_plan_for_a_pinned_profile_is_read_only_and_names_how_to_get_the_iso() {
     let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
     assert!(stdout.contains("present: false"));
     assert!(stdout.contains("downloading: false"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn image_status_with_stale_empty_or_corrupt_lock_reports_not_downloading_and_preserves_lock() {
+    let dir = boot_scratch("stale-lock");
+    let lock_dir = dir.join(".nousb/artifacts/ubuntu-24.04-server");
+    std::fs::create_dir_all(&lock_dir).expect("create artifact dir");
+    let lock_path = lock_dir.join("download.lock");
+
+    // 1. Stale lock whose PID is gone. Status must report downloading: false and NOT delete the lock.
+    std::fs::write(&lock_path, "pid=99999999\n").expect("write stale lock");
+    let status = nousb()
+        .current_dir(&dir)
+        .args(["image", "status", "ubuntu-24.04-server"])
+        .output()
+        .expect("run nousb image status with stale lock");
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
+    if cfg!(any(target_os = "linux", target_os = "windows")) {
+        assert!(stdout.contains("downloading: false"));
+    }
+    assert!(
+        lock_path.exists(),
+        "read-only status must not delete stale lock"
+    );
+
+    // 2. Empty 0-byte lock file.
+    std::fs::write(&lock_path, "").expect("write empty lock");
+    let status = nousb()
+        .current_dir(&dir)
+        .args(["image", "status", "ubuntu-24.04-server"])
+        .output()
+        .expect("run nousb image status with empty lock");
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("downloading: false"));
+    assert!(
+        lock_path.exists(),
+        "read-only status must not delete empty lock"
+    );
+
+    // 3. Garbage / unparseable lock file.
+    std::fs::write(&lock_path, "garbage_pid_data\n").expect("write garbage lock");
+    let status = nousb()
+        .current_dir(&dir)
+        .args(["image", "status", "ubuntu-24.04-server"])
+        .output()
+        .expect("run nousb image status with garbage lock");
+    assert!(status.status.success());
+    let stdout = String::from_utf8(status.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("downloading: false"));
+    assert!(
+        lock_path.exists(),
+        "read-only status must not delete garbage lock"
+    );
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
